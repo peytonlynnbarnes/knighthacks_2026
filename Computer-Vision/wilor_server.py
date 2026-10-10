@@ -19,6 +19,10 @@ API (header X-Token: <secret> on every request):
                    -> {"views": [{"hands": [hand, ...]}, ...], "infer_ms": ...}
     hand = {"is_right", "points" (21 [x, y] pixels, MediaPipe order), "palm" [x, y],
             "R" (3x3 hand frame in camera axes, see wilor_pub.py), "rpy_deg"}
+
+Hands are tracked between requests per frame position (camera 0, camera 1, ...),
+so this serves one client at a time; the first start also tunes the GPU's matrix
+kernels (TunableOp, saved in ~/.cache/wilor/), later starts reuse that.
 """
 import argparse
 import os
@@ -44,20 +48,11 @@ def hand_json(hand):
             "rpy_deg": [round(a, 1) for a in hand.rpy()]}
 
 
-def warm_up(tracker):
-    """First GPU calls are slow (kernel loading); do them now, not on the first frame."""
-    blank = np.zeros((480, 640, 3), np.uint8)
-    t = time.perf_counter()
-    tracker.pipe.predict(blank)                                      # hand detector
-    tracker.pipe.predict_with_bboxes(blank, np.array([[220.0, 140.0, 420.0, 340.0]]), [1.0])  # WiLoR
-    return (time.perf_counter() - t) * 1000
-
-
-def create_app(token):
+def create_app(token, precision="fp16", tunable=True):
     import torch
-    tracker = WiLoRTracker()
+    tracker = WiLoRTracker(precision=precision, tunable=tunable)
     gpu = torch.cuda.get_device_name(0) if torch.cuda.is_available() else "CPU (no GPU found)"
-    warmup_ms = warm_up(tracker)
+    warmup_ms = tracker.warm_up(max_crops=4, max_views=2)  # 2 cameras x 2 hands
     lock = threading.Lock()  # one model on one GPU: one request at a time
     app = FastAPI()
 
@@ -68,7 +63,8 @@ def create_app(token):
     @app.get("/health")
     def health(x_token: str = Header("")):
         check(x_token)
-        return {"ok": True, "gpu": gpu, "warmup_ms": round(warmup_ms)}
+        return {"ok": True, "gpu": gpu, "warmup_ms": round(warmup_ms),
+                "precision": tracker.precision, "tunableop": tracker.tunable}
 
     @app.post("/detect")
     async def detect(request: Request, x_token: str = Header(""), x_sizes: str = Header("")):
@@ -89,9 +85,9 @@ def create_app(token):
             offset += n
 
         def run():
-            with lock:
+            with lock:  # all views: one detector call (when needed) and one model call
                 t = time.perf_counter()
-                views = [{"hands": [hand_json(h) for h in tracker.process(f)]} for f in frames]
+                views = [{"hands": [hand_json(h) for h in hands]} for hands in tracker.process_many(frames)]
                 return views, (time.perf_counter() - t) * 1000
 
         views, infer_ms = await run_in_threadpool(run)  # keeps /health responsive meanwhile
@@ -105,12 +101,16 @@ def main():
     ap.add_argument("--host", default="127.0.0.1",
                     help="listen address (keep 127.0.0.1 and use the SSH tunnel)")
     ap.add_argument("--port", type=int, default=8000)
+    ap.add_argument("--precision", default="fp16", choices=["fp16", "bf16-backbone", "bf16"],
+                    help="GPU number format; run wilor_bench.py once to find the fastest on this GPU")
+    ap.add_argument("--no-tunableop", action="store_true", help="don't tune matrix kernels")
     args = ap.parse_args()
     token = os.environ.get("WILOR_TOKEN", "")
     if not token:
         sys.exit("set WILOR_TOKEN to a secret first (the laptop needs the same value)")
-    print("loading WiLoR and warming up the GPU ...", flush=True)
-    app = create_app(token)
+    print(f"loading WiLoR ({args.precision}, TunableOp {'off' if args.no_tunableop else 'on'}) "
+          "and warming up the GPU ...", flush=True)
+    app = create_app(token, args.precision, not args.no_tunableop)
     print(f"WiLoR server ready on http://{args.host}:{args.port}  (Ctrl-C stops)", flush=True)
     uvicorn.run(app, host=args.host, port=args.port, log_level="warning")
 

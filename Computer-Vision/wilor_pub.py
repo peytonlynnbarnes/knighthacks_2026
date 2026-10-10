@@ -10,6 +10,13 @@ which MANO places from the hand's root rotation alone, so it is WiLoR's
 rotation expressed in the same hand frame the rest of the pipeline uses.
 roll/pitch/yaw here are relative to the camera (x right, y down, z forward).
 
+Speed (WiLoRTracker): the hand detector runs only every --redetect frames or when
+the hand is lost; in between, the crop follows the previous keypoints. On a GPU
+the model runs in --precision (default FP16: on an MI300X it's within ~1.5 ms of
+the BF16 options and 4-9x closer to FP32; wilor_bench.py checks a GPU), and PyTorch TunableOp
+picks the fastest matrix kernels, saved in ~/.cache/wilor/ (the first start
+tunes for a while; later starts reuse it).
+
 Setup (once, in the venv). Install AMD's ROCm PyTorch first ("Install PyTorch
 for Radeon GPUs on WSL"); --no-deps keeps WiLoR-mini from replacing it:
     pip install --no-deps git+https://github.com/warmshao/WiLoR-mini
@@ -21,18 +28,26 @@ The first run downloads the models (~2.5 GB) from Hugging Face.
 Run:
     .venv/bin/python Computer-Vision/wilor_pub.py             # camera 0
     .venv/bin/python Computer-Vision/wilor_pub.py --cam 2
-    .venv/bin/python Computer-Vision/wilor_pub.py --bgr       # if keypoints look off
+    .venv/bin/python Computer-Vision/wilor_pub.py --redetect 1   # detector every frame
 q quits.
 """
 import argparse
 import math
+import os
 import time
 
 import cv2
 import numpy as np
+import torch
+from skimage.filters import gaussian
 
 import hand3d as h3
 from stereo_cam import HAND_CONNECTIONS
+
+try:  # WiLoR-mini's crop/projection helpers (only needed where WiLoR is installed)
+    from wilor_mini.utils import utils as wutils
+except ImportError:
+    wutils = None
 
 # 0 = wrist, 5 = index MCP, 9 = middle MCP, 13 = ring MCP, 17 = pinky MCP
 PALM_POINTS = [0, 5, 9, 13, 17]
@@ -40,6 +55,8 @@ PALM_POINTS = [0, 5, 9, 13, 17]
 FINGERTIPS = {"thumb": 4, "index": 8, "middle": 12, "ring": 16, "pinky": 20}
 
 AXIS_M = 0.05  # drawn axis length (m)
+
+TUNABLEOP_FILE = os.path.join(os.path.expanduser("~"), ".cache", "wilor", "tunableop_results.csv")
 
 
 class WiLoRHand:
@@ -102,35 +119,203 @@ class WiLoRHand:
         print(f"{label} ({'right' if self.is_right else 'left'}): " + " ".join(parts))
 
 
-class WiLoRTracker:
-    """Wraps WiLoR-mini and returns WiLoRHand objects for each frame."""
+def _to_fp32(obj):
+    """Every floating-point tensor in a (nested) model output, as float32."""
+    if torch.is_tensor(obj):
+        return obj.float() if obj.is_floating_point() else obj
+    if isinstance(obj, dict):
+        return {k: _to_fp32(v) for k, v in obj.items()}
+    if isinstance(obj, (list, tuple)):
+        return type(obj)(_to_fp32(v) for v in obj)
+    return obj
 
-    def __init__(self, rgb=True):
-        import os
-        import torch
+
+class BF16Backbone(torch.nn.Module):
+    """WiLoR's ViT backbone (~95% of the work) in BF16, with its outputs returned in
+    FP32 so the refinement net and MANO keep full precision. Measured against FP32:
+    0.4 px mean keypoint error this way, ~1 px with BF16 everywhere."""
+
+    def __init__(self, backbone):
+        super().__init__()
+        self.inner = backbone.to(torch.bfloat16)
+
+    def forward(self, x):
+        return _to_fp32(self.inner(x.to(torch.bfloat16)))
+
+
+def enable_tunableop():
+    """PyTorch TunableOp: benchmark the GPU's matrix-multiply kernels for each matrix
+    shape the first time it appears and keep the fastest. The choices are saved to
+    TUNABLEOP_FILE when the program exits normally (Ctrl-C / q), and read back at
+    the next start."""
+    os.makedirs(os.path.dirname(TUNABLEOP_FILE), exist_ok=True)
+    torch.cuda.tunable.set_filename(TUNABLEOP_FILE)
+    torch.cuda.tunable.enable(True)
+    torch.cuda.tunable.tuning_enable(True)
+
+
+class WiLoRTracker:
+    """Runs WiLoR on the frames of one or more cameras and returns WiLoRHand objects.
+
+    Hands are found with WiLoR's YOLO detector, then tracked: on the next frame the
+    crop comes from a box around the previous keypoints and the detector is skipped.
+    The detector runs again every `redetect_every` frames, and right away for a view
+    with no tracked hand (none yet, lost, or implausible jump). All crops of all
+    views go through the model in one batch.
+    """
+
+    RESCALE = 2.5      # crop side = 2.5 x the hand box's longer side (WiLoR-mini's default)
+    BOX_FROM_KP = 1.2  # YOLO's hand box is ~1.2x the keypoints' extent (measured)
+    # GPU number formats: whole model FP16 / ViT in BF16 with an FP32 head / whole model
+    # BF16 (fp32 is the accuracy reference for wilor_bench.py). On an MI300X all three
+    # are within ~5% in speed and FP16 is by far the most accurate, hence the default.
+    PRECISIONS = {"fp16": torch.float16, "bf16-backbone": torch.float32,
+                  "bf16": torch.bfloat16, "fp32": torch.float32}
+
+    def __init__(self, rgb=False, redetect_every=3, tunable=True, precision="fp16"):
         from wilor_mini.pipelines.wilor_hand_pose3d_estimation_pipeline import (
             WiLorHandPose3dEstimationPipeline)
+        if precision not in self.PRECISIONS:
+            raise ValueError(f"precision must be one of {list(self.PRECISIONS)}")
         gpu = torch.cuda.is_available()  # ROCm builds of PyTorch show the AMD GPU as "cuda"
         if not gpu:
             print("WARNING: PyTorch sees no GPU, running WiLoR on the CPU (slow)")
+        self.precision = precision if gpu else "fp32"
+        self.dtype = self.PRECISIONS[self.precision]  # what the model's input and weights use
+        self.tunable = gpu and tunable
+        if self.tunable:
+            enable_tunableop()
         # WiLoR's detector.pt was pickled by an old ultralytics and fails PyTorch
         # >= 2.6's weights-only torch.load; allow a full load for WiLoR's own files only
         old = os.environ.get("TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD")
         os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = "1"
         try:
             self.pipe = WiLorHandPose3dEstimationPipeline(
-                device=torch.device("cuda" if gpu else "cpu"),
-                dtype=torch.float16 if gpu else torch.float32, verbose=False)
+                device=torch.device("cuda" if gpu else "cpu"), dtype=self.dtype, verbose=False)
         finally:
             if old is None:
                 del os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"]
             else:
                 os.environ["TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD"] = old
+        if self.precision == "bf16-backbone":
+            self.pipe.wilor_model.backbone = BF16Backbone(self.pipe.wilor_model.backbone)
+        self.device = self.pipe.device
+        # the model flips channels BGR -> RGB itself, so it wants OpenCV's BGR as is
         self.rgb = rgb
+        self.redetect_every = redetect_every
+        self.frames_seen = 0
+        self.tracks = {}  # view index -> [(box [x0 y0 x1 y1], is_right), ...]
 
     def process(self, frame):
-        img = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB) if self.rgb else frame
-        return [WiLoRHand(det, frame.shape) for det in self.pipe.predict(img)]
+        return self.process_many([frame])[0]
+
+    @torch.no_grad()
+    def process_many(self, frames):
+        """A list of WiLoRHands for each frame. Pass all cameras' frames together, in
+        the same order every call: the order is how tracks stay with their camera."""
+        imgs = [cv2.cvtColor(f, cv2.COLOR_BGR2RGB) if self.rgb else f for f in frames]
+        periodic = self.redetect_every <= 1 or self.frames_seen % self.redetect_every == 0
+        self.frames_seen += 1
+        search = [v for v in range(len(imgs)) if periodic or not self.tracks.get(v)]
+        if search:  # one detector call for every view that needs it
+            for v, det in zip(search, self.pipe.hand_detector([imgs[v] for v in search],
+                                                              conf=0.3, verbose=False)):
+                found = [(box[:4].cpu().numpy().astype(float), float(cls))
+                         for box, cls in zip(det.boxes.data, det.boxes.cls)]
+                self.tracks[v] = self._match(found, self.tracks.get(v, []))
+
+        jobs = [(v, box, right) for v in range(len(imgs)) for box, right in self.tracks.get(v, [])]
+        hands = [[] for _ in frames]
+        if not jobs:
+            return hands
+        crops = [self._crop(imgs[v], box, right) for v, box, right in jobs]
+        x = torch.from_numpy(np.stack([patch for patch, _, _ in crops])).to(self.device, self.dtype)
+        out = {k: t.float().cpu().numpy() for k, t in self.pipe.wilor_model(x).items()}
+
+        next_tracks = {v: [] for v in range(len(imgs))}
+        for i, ((v, box, right), (_, center, size)) in enumerate(zip(jobs, crops)):
+            hand = WiLoRHand(self._result(out, i, box, right, center, size, imgs[v].shape), frames[v].shape)
+            hands[v].append(hand)
+            nxt = self._next_box(hand.points, box, frames[v].shape)
+            if nxt is not None:
+                next_tracks[v].append((nxt, right))
+        self.tracks = next_tracks
+        return hands
+
+    @staticmethod
+    def _match(found, tracks):
+        """Detections -> tracks. A detection on an already-tracked hand keeps the
+        tracked box, so re-detecting doesn't make the keypoints jump; tracks nothing
+        was detected on are dropped (hand gone); unmatched detections are new hands."""
+        out, free = [], list(range(len(tracks)))
+        for box, right in found:
+            center = (box[0:2] + box[2:4]) / 2
+            hit = next((i for i in free
+                        if (tracks[i][0][0:2] <= center).all() and (center <= tracks[i][0][2:4]).all()), None)
+            if hit is None:
+                out.append((box, right))
+            else:
+                free.remove(hit)
+                out.append((tracks[hit][0], right))
+        return out
+
+    def _crop(self, img, box, right):
+        """256x256 model input around one hand, mirrored for left hands (as WiLoR-mini)."""
+        center = (box[2:4] + box[0:2]) / 2.0
+        size = self.RESCALE * (box[2:4] - box[0:2]).max()
+        side = self.pipe.IMAGE_SIZE
+        downsample = size / side / 2.0
+        if downsample > 1.1:  # big hand: blur first to avoid aliasing
+            img = gaussian(img, sigma=(downsample - 1) / 2, channel_axis=2, preserve_range=True)
+        patch, _ = wutils.generate_image_patch_cv2(img, center[0], center[1], size, size, side, side,
+                                                   right == 0, 1.0, 0, border_mode=cv2.BORDER_CONSTANT)
+        return patch, center, size
+
+    def _result(self, out, i, box, right, center, size, shape):
+        """Hand i of the batch, in full-image terms (WiLoR-mini's post-processing)."""
+        pred = {k: v[[i]].copy() for k, v in out.items()}
+        pred["pred_cam"][:, 1] *= 2 * right - 1
+        if right == 0:  # the model saw a mirrored left hand: mirror the result back
+            pred["pred_keypoints_3d"][:, :, 0] *= -1
+            pred["pred_vertices"][:, :, 0] *= -1
+            pred["global_orient"][:, :, 1:3] *= -1
+            pred["hand_pose"][:, :, 1:3] *= -1
+        img_size = np.array([shape[1], shape[0]])
+        focal = self.pipe.FOCAL_LENGTH / self.pipe.IMAGE_SIZE * img_size.max()
+        pred["pred_cam_t_full"] = wutils.cam_crop_to_full(pred["pred_cam"], center[None], size,
+                                                          img_size[None], focal)
+        pred["scaled_focal_length"] = focal
+        pred["pred_keypoints_2d"] = wutils.perspective_projection(
+            pred["pred_keypoints_3d"], translation=pred["pred_cam_t_full"],
+            focal_length=np.array([focal] * 2)[None], camera_center=img_size[None] / 2)
+        return {"hand_bbox": box.tolist(), "is_right": right, "wilor_preds": pred}
+
+    def _next_box(self, points, box, shape):
+        """Hand box for the next frame from this frame's keypoints, or None if the hand
+        looks lost (off-screen, or a jump no real hand makes in one frame)."""
+        lo, hi = points.min(axis=0), points.max(axis=0)
+        h, w = shape[:2]
+        if not np.isfinite(points).all() or (hi <= 0).any() or lo[0] >= w or lo[1] >= h:
+            return None
+        center, extent = (lo + hi) / 2, (hi - lo) * self.BOX_FROM_KP
+        ratio = extent.max() / (box[2:4] - box[0:2]).max()
+        inside = (box[0:2] <= center).all() and (center <= box[2:4]).all()
+        if not inside or not 0.5 < ratio < 2.0:
+            return None
+        return np.concatenate([center - extent / 2, center + extent / 2])
+
+    def warm_up(self, max_crops=4, max_views=2):
+        """Run every batch size once so GPU kernels load, and TunableOp tunes every
+        matrix shape, now instead of during the first frames. Returns ms."""
+        t = time.perf_counter()
+        blank = np.zeros((480, 640, 3), np.uint8)
+        for n in range(1, max_views + 1):
+            self.pipe.hand_detector([blank] * n, conf=0.3, verbose=False)
+        with torch.no_grad():
+            for n in range(1, max_crops + 1):
+                self.pipe.wilor_model(torch.zeros(n, self.pipe.IMAGE_SIZE, self.pipe.IMAGE_SIZE, 3,
+                                                  device=self.device, dtype=self.dtype))
+        return (time.perf_counter() - t) * 1000
 
     def close(self):
         pass
@@ -139,7 +324,13 @@ class WiLoRTracker:
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cam", type=int, default=0, help="camera index (/dev/videoN)")
-    ap.add_argument("--bgr", action="store_true", help="feed WiLoR BGR instead of RGB")
+    ap.add_argument("--redetect", type=int, default=3,
+                    help="run the hand detector every N frames (1 = every frame)")
+    ap.add_argument("--rgb", action="store_true",
+                    help="feed WiLoR RGB (wrong for this model, which expects BGR; for comparison)")
+    ap.add_argument("--no-tunableop", action="store_true", help="don't tune matrix kernels")
+    ap.add_argument("--precision", default="fp16", choices=["fp16", "bf16-backbone", "bf16"],
+                    help="GPU number format (wilor_bench.py finds the fastest)")
     args = ap.parse_args()
 
     cap = cv2.VideoCapture(args.cam)
@@ -150,7 +341,10 @@ def main():
         print("Cannot open camera")
         return
 
-    tracker = WiLoRTracker(rgb=not args.bgr)
+    tracker = WiLoRTracker(rgb=args.rgb, redetect_every=args.redetect, tunable=not args.no_tunableop,
+                           precision=args.precision)
+    print("warming up (the first run also tunes the GPU's matrix kernels) ...", flush=True)
+    print(f"ready after {tracker.warm_up(max_crops=2, max_views=1) / 1000:.1f} s", flush=True)
     try:
         while True:
             ret, frame = cap.read()

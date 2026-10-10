@@ -55,10 +55,9 @@ PIP="$VENV/bin/pip"
 cd "$HERE"
 "$VENV/bin/python" -c "
 import torch
-from wilor_server import warm_up
 from wilor_pub import WiLoRTracker
-ms = warm_up(WiLoRTracker())
-print(f'WiLoR ready on {torch.cuda.get_device_name(0)} (warm-up {ms:.0f} ms)')
+ms = WiLoRTracker().warm_up(max_crops=4, max_views=2)
+print(f'WiLoR ready on {torch.cuda.get_device_name(0)} (warm-up incl. kernel tuning {ms / 1000:.0f} s)')
 "
 echo
 echo "Start the server (keep it running, e.g. inside tmux):"

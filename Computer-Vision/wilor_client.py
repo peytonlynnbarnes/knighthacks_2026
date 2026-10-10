@@ -13,12 +13,18 @@ Run:
                                                       # connection test, no camera
 q quits. The video is shown with the result it belongs to, so it lags the live
 camera by one round trip.
+
+The status line shows the round trip (and the server's share of it) and the
+results per second over the last 2 seconds. 4 requests are kept in flight
+(--inflight): if the round trip climbs well above its usual value, the upload is
+full; then use --inflight 3 or --quality 60.
 """
 import argparse
 import os
 import sys
 import threading
 import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -27,6 +33,7 @@ import requests
 from stereo_cam import HAND_CONNECTIONS
 
 FINGERTIPS = {"thumb": 4, "index": 8, "middle": 12, "ring": 16, "pinky": 20}
+RATE_WINDOW_S = 2.0  # results/s is measured over this many recent seconds
 
 
 class RemoteHand:
@@ -67,7 +74,7 @@ class CloudWiLoR:
     """Sends frames from `inflight` worker threads, always the newest one, and keeps
     only the newest result, so a slow network drops frames instead of piling up lag."""
 
-    def __init__(self, url, token, inflight=2, quality=80, timeout=3.0):
+    def __init__(self, url, token, inflight=4, quality=80, timeout=3.0):
         self.url, self.headers, self.quality, self.timeout = url.rstrip("/"), {"X-Token": token}, quality, timeout
         self.cond = threading.Condition()
         self.pending = None   # (seq, frames) newest frame(s) not sent yet
@@ -145,7 +152,9 @@ def main():
     ap.add_argument("--token", default=os.environ.get("WILOR_TOKEN", ""), help="default: $WILOR_TOKEN")
     ap.add_argument("--cams", type=int, nargs="+", default=[0], help="camera indices (/dev/videoN)")
     ap.add_argument("--image", help="send this image instead of a camera (connection test)")
-    ap.add_argument("--inflight", type=int, default=2, help="requests in flight (2 hides the round trip)")
+    ap.add_argument("--inflight", type=int, default=4,
+                    help="requests in flight: more = more results/s, same round trip, until the "
+                         "upload is full (then the round trip grows: use fewer, or a lower --quality)")
     ap.add_argument("--quality", type=int, default=80, help="JPEG quality sent to the server")
     ap.add_argument("--count", type=int, default=0, help="stop after this many results (0 = run until q)")
     ap.add_argument("--no-view", action="store_true", help="no window, just print")
@@ -155,7 +164,8 @@ def main():
 
     cloud = CloudWiLoR(args.url, args.token, args.inflight, args.quality)
     info = cloud.check()
-    print(f"connected: server GPU {info['gpu']}", flush=True)
+    extra = f" | {info['precision']}, TunableOp {'on' if info['tunableop'] else 'off'}" if "precision" in info else ""
+    print(f"connected: server GPU {info['gpu']}{extra}", flush=True)
 
     caps = []
     if args.image:
@@ -171,7 +181,8 @@ def main():
                 sys.exit(f"Cannot open camera {i}")
             caps.append(cap)
 
-    shown, results, last_seq, t0 = None, 0, 0, time.perf_counter()
+    shown, results, last_seq = None, 0, 0
+    recent = deque()  # arrival times of results in the last RATE_WINDOW_S seconds
     try:
         while True:
             if args.image:
@@ -196,8 +207,12 @@ def main():
                         hand = RemoteHand(d)
                         hand.draw(frame)
                         hand.print_coords(f"cam {v} hand {i}")
-                fps = results / (time.perf_counter() - t0)
-                status = f"round trip {rtt_ms:.0f} ms (GPU {infer_ms:.0f} ms)  {fps:.1f} results/s"
+                now = time.perf_counter()
+                recent.append(now)
+                while now - recent[0] > RATE_WINDOW_S:
+                    recent.popleft()
+                rate = (len(recent) - 1) / (now - recent[0]) if len(recent) > 1 else 0.0
+                status = f"round trip {rtt_ms:.0f} ms (GPU {infer_ms:.0f} ms)  {rate:.1f} results/s"
                 print(status, flush=True)
                 for frame in shown:
                     cv2.putText(frame, status, (10, 25), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 255), 2)
