@@ -1,0 +1,94 @@
+/home/peyton/kh/Computer-Vision/WiLoR/.venv/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/home/peyton/kh/Computer-Vision/WiLoR/.venv/lib/python3.12/site-packages/lightning_fabric/utilities/cloud_io.py:73: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+Lightning automatically upgraded your loaded checkpoint from v1.8.1 to v2.6.6. To apply the upgrade to your files permanently, run `python -m pytorch_lightning.utilities.upgrade_checkpoint pretrained_models/wilor_final.ckpt`
+/home/peyton/kh/Computer-Vision/WiLoR/.venv/lib/python3.12/site-packages/ultralytics/nn/tasks.py:716: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  ckpt = torch.load(file, map_location="cpu")
+/home/peyton/kh/Computer-Vision/WiLoR/repo/wilor/utils/geometry.py:61: UserWarning: Using torch.cross without specifying the dim arg is deprecated.
+Please either pass the dim explicitly or simply use torch.linalg.cross.
+The default value of dim will change to agree with that of linalg.cross in a future release. (Triggered internally at ../aten/src/ATen/native/Cross.cpp:62.)
+  b3 = torch.cross(b1, b2)
+stereo rig: /home/peyton/kh/Computer-Vision/common/calib/stereo.npz (board), 640x480, baseline 20.4 cm
+Loading  ./pretrained_models/wilor_final.ckpt
+WARNING: You are using a MANO model, with only 10 shape coefficients.
+WiLoR warm-up 4.9 s
+landmarks: wilor
+replaying frames still (872 pairs) through wilor; recorded with: --backend wilor --no-ros --record-frames still
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s   0 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s   0 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  66 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  66 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  71 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  71 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  67 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  67 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  33 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  33 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  18 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.9 cm]  18 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.9 cm]  18 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.9 cm]  18 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.9 cm]  18 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.9 cm]  18 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.9 cm]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.56        0.04       -0.83], 2 deg off level]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 5/7: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back  [roll -90 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +51 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +51 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +51 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +51 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +51 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +51 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +51 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +51 deg]  18 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -47 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -47 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -47 deg]  18 fps
+hand calibrated (pitch -47 deg)
+gripper: fully open at curl >= 1.00, closed at <= 0.85
+roll gain -/+ -1.17 / -1.17  (hand range -90deg, default)
+pitch gain -/+ 2.11 / 1.96  (hand range -47deg, +51deg)
+    TRACKING [stereo] grip 0.00 (curl 1.01)  18 fps  xyz cm   +1.0   +0.7   -0.2  rpy deg    +0   -12    +3  hand   +1   -7   +5  palm 22deg
+    TRACKING [stereo] grip 0.00 (curl 1.01)  17 fps  xyz cm   +1.1   +0.6   -0.3  rpy deg    +0   -14    +6  hand   +1   -8   +7  palm 23deg
+    TRACKING [stereo] grip 0.00 (curl 1.01)  17 fps  xyz cm   +1.4   +0.7   -0.6  rpy deg    -0   -12    +5  hand   +1   -7   +6  palm 21deg
+    TRACKING [stereo] grip 0.00 (curl 1.01)  17 fps  xyz cm   +1.6   +0.7   -0.6  rpy deg    +0   -12    +5  hand   +1   -7   +6  palm 20deg  jitter  3.7 mm  2.2 deg
+    TRACKING [stereo] grip 0.00 (curl 1.01)  17 fps  xyz cm   +1.9   +0.6   -0.7  rpy deg    +0   -12    +5  hand   +1   -7   +7  palm 22deg  jitter  3.5 mm  1.6 deg
+    TRACKING [stereo] grip 0.00 (curl 1.01)  17 fps  xyz cm   +1.9   +0.7   -0.7  rpy deg    +0   -12    +6  hand   +0   -7   +7  palm 22deg  jitter  3.3 mm  1.8 deg
+    TRACKING [stereo] grip 0.00 (curl 1.00)  17 fps  xyz cm   +1.8   +0.8   -0.8  rpy deg    -0   -11    +6  hand   +0   -6   +7  palm 23deg  jitter  2.2 mm  1.8 deg
+    TRACKING [stereo] grip 0.00 (curl 1.01)  17 fps  xyz cm   +1.7   +0.7   -0.8  rpy deg    +0   -11    +5  hand   +0   -6   +7  palm 25deg  jitter  2.0 mm  2.0 deg
+    TRACKING [stereo] grip 0.00 (curl 1.00)  17 fps  xyz cm   +1.8   +0.6   -0.9  rpy deg    +0   -11    +5  hand   +0   -6   +6  palm 20deg  jitter  1.8 mm  1.9 deg
+    TRACKING [stereo] grip 0.00 (curl 1.00)  17 fps  xyz cm   +2.1   +0.6   -0.9  rpy deg    -0   -11    +6  hand   +0   -6   +7  palm 21deg  jitter  2.3 mm  1.9 deg
+    TRACKING [stereo] grip 0.00 (curl 1.01)  17 fps  xyz cm   +1.8   +0.7   -1.0  rpy deg    -0   -11    +6  hand   +0   -6   +7  palm 23deg  jitter  2.3 mm  1.9 deg
+    TRACKING [stereo] grip 0.00 (curl 1.00)  16 fps  xyz cm   +1.8   +0.4   -1.1  rpy deg    +0   -10    +5  hand   +1   -6   +6  palm 21deg  jitter  2.9 mm  1.9 deg
+    TRACKING [stereo] grip 0.00 (curl 1.01)  17 fps  xyz cm   +2.0   +0.5   -1.0  rpy deg    -0   -10    +6  hand   +1   -6   +7  palm 22deg  jitter  2.9 mm  2.0 deg
+    TRACKING [stereo] grip 0.00 (curl 1.00)  17 fps  xyz cm   +2.2   +0.5   -1.1  rpy deg    +0   -11    +6  hand   +1   -6   +7  palm 22deg  jitter  3.0 mm  1.7 deg
+    TRACKING [stereo] grip 0.01 (curl 1.00)  18 fps  xyz cm   +2.3   +0.7   -1.1  rpy deg    -0   -10    +6  hand   +0   -6   +7  palm 21deg  jitter  2.7 mm  1.6 deg
+    TRACKING [stereo] grip 0.05 (curl 0.99)  18 fps  xyz cm   +2.1   +0.5   -1.9  rpy deg    +2   -19   +11  hand   -3  -10  +11  palm 39deg  jitter  6.3 mm  4.3 deg
+    no hand (clutch: holding): no hand  34 fps  xyz cm   +2.6   +0.3   -3.3  rpy deg    +3   -36   +17  hand   -4  -18  +17  palm 43deg
+recorded 872 frames (57 s) -> Computer-Vision/common/recordings/wilor/lm_wl_still.npz

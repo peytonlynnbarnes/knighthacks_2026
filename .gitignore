@@ -6,4 +6,17 @@ ros_ws/build/
 ros_ws/install/
 ros_ws/log/
 __pycache__/
-Computer-Vision/models/
+Computer-Vision/MediaPipe/models/
+Computer-Vision/WiLoR/repo/
+Computer-Vision/WiLoR/.venv/
+
+# --record-frames video recordings (~2 MB/s, JPEG streams; replay with --replay-frames)
+*.jpgs
+/still/
+/sweep/
+/reach/
+/drop-out/
+/dropout/
+/edge-on/
+/cam_bug/
+/frames_*/

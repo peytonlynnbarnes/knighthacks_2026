@@ -1,0 +1,91 @@
+/home/peyton/kh/Computer-Vision/WiLoR/.venv/lib/python3.12/site-packages/timm/models/layers/__init__.py:49: FutureWarning: Importing from timm.models.layers is deprecated, please import via timm.layers
+  warnings.warn(f"Importing from {__name__} is deprecated, please import via timm.layers", FutureWarning)
+/home/peyton/kh/Computer-Vision/WiLoR/.venv/lib/python3.12/site-packages/lightning_fabric/utilities/cloud_io.py:73: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+Lightning automatically upgraded your loaded checkpoint from v1.8.1 to v2.6.6. To apply the upgrade to your files permanently, run `python -m pytorch_lightning.utilities.upgrade_checkpoint pretrained_models/wilor_final.ckpt`
+/home/peyton/kh/Computer-Vision/WiLoR/.venv/lib/python3.12/site-packages/ultralytics/nn/tasks.py:716: FutureWarning: You are using `torch.load` with `weights_only=False` (the current default value), which uses the default pickle module implicitly. It is possible to construct malicious pickle data which will execute arbitrary code during unpickling (See https://github.com/pytorch/pytorch/blob/main/SECURITY.md#untrusted-models for more details). In a future release, the default value for `weights_only` will be flipped to `True`. This limits the functions that could be executed during unpickling. Arbitrary objects will no longer be allowed to be loaded via this mode unless they are explicitly allowlisted by the user via `torch.serialization.add_safe_globals`. We recommend you start setting `weights_only=True` for any use case where you don't have full control of the loaded file. Please open an issue on GitHub for any issues related to this experimental feature.
+  ckpt = torch.load(file, map_location="cpu")
+/home/peyton/kh/Computer-Vision/WiLoR/repo/wilor/utils/geometry.py:61: UserWarning: Using torch.cross without specifying the dim arg is deprecated.
+Please either pass the dim explicitly or simply use torch.linalg.cross.
+The default value of dim will change to agree with that of linalg.cross in a future release. (Triggered internally at ../aten/src/ATen/native/Cross.cpp:62.)
+  b3 = torch.cross(b1, b2)
+stereo rig: /home/peyton/kh/Computer-Vision/common/calib/stereo.npz (board), 640x480, baseline 20.4 cm
+Loading  ./pretrained_models/wilor_final.ckpt
+WARNING: You are using a MANO model, with only 10 shape coefficients.
+WiLoR warm-up 5.4 s
+landmarks: wilor
+replaying frames drop-out (884 pairs) through wilor; recorded with: --backend wilor --no-ros --record-frames drop-out
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s   0 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s   0 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  66 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  66 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  17 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  17 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  17 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  17 fps
+    CALIB 1/7: open hand, palm to cameras, hold still 2 s  17 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.8 cm]  17 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.8 cm]  18 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.8 cm]  18 fps
+    CALIB 2/7: move hand ~15 cm in the ARM's forward (+X) direction, hold  [palm width 5.8 cm]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  18 fps
+    CALIB 3/7: bring hand back to the start position  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  17 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  17 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  17 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  17 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  18 fps
+    CALIB 4/7: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back  [forward = cam [       0.13       -0.06       -0.99], 3 deg off level]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  18 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  16 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  16 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  17 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  17 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  17 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  17 fps
+    CALIB 6/7: now TILT the other way as far as it tracks, then back  [pitch +19 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  17 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  36 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  36 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  27 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  27 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  24 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  24 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  30 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  30 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  16 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  16 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  45 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  45 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  16 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  16 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  42 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  42 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  29 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  29 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  40 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  40 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  15 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  25 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  25 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  20 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  20 fps
+    CALIB 7/7: hand back at the start, palm to cameras  [pitch -76 deg]  20 fps
+recorded 884 frames (49 s) -> Computer-Vision/common/recordings/wilor/lm_wl_drop_out.npz
