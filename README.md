@@ -82,8 +82,10 @@ pip install --no-build-isolation git+https://github.com/mattloper/chumpy   # nee
 python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"   # must be True
 ```
 
-If numpy is **2.x** and the WiLoR self-test in step 6 fails to import (chumpy or ultralytics),
-make a conda env with numpy 1.26 instead: see `MAC_INTEGRATION.md` ("Risks").
+`requirements.txt` pins `numpy==1.26.4` (what ROS 2 Jazzy was built with, as on the Ubuntu setup)
+and `opencv-python<4.12` (OpenCV 4.12+ pulls in numpy 2). If `conda list numpy` ever shows numpy
+2.x or two numpy entries, pip replaced it: `pip uninstall -y numpy opencv-python`,
+`conda install -y --force-reinstall numpy=1.26.4`, then run this step again.
 
 ### 4. Build the ROS workspace
 

@@ -10,8 +10,12 @@
 feetech-servo-sdk==1.0.0
 pyyaml                 # rclpy needs it when ROS is used from this env (feetech_mirror.py)
 
-# cameras + geometry (pip picks a build that fits the pinned numpy)
-opencv-python
+# numpy: the version conda's ROS 2 Jazzy was built with (1.26.4, like the Ubuntu setup);
+# never let pip move it to 2.x
+numpy==1.26.4
+
+# cameras + geometry: OpenCV 4.12+ requires numpy 2, which breaks the pin above
+opencv-python<4.12
 
 # WiLoR (Computer-Vision/WiLoR/; weights + MANO in WiLoR/repo/, copied by hand, never committed)
 torch==2.5.1
