@@ -1,5 +1,25 @@
+# macOS (mac-version branch). Install INTO the conda env that has ROS 2 Jazzy, with numpy
+# held at conda's version (ROS's message packages are built against it):
+#   python -c "import numpy; print(f'numpy=={numpy.__version__}')" > /tmp/numpy-pin.txt
+#   pip install -r requirements.txt -c /tmp/numpy-pin.txt
+#   pip install --no-build-isolation git+https://github.com/mattloper/chumpy   # MANO loading
+# Versions pinned below are the ones WiLoR ran with on the old machine (torch 2.5.1:
+# newer torch defaults torch.load to weights_only=True, which the checkpoints don't pass).
+
+# servos
 feetech-servo-sdk==1.0.0
-pyyaml  # rclpy needs it when ROS is used from this venv (feetech_mirror.py)
-numpy==1.26.4  # same as system numpy that ROS Jazzy msgs are built against
-mediapipe==1.1.0  # hand landmarks (mediapipe/hand_tracker.py)
-opencv-contrib-python<4.12  # pulled in by mediapipe; 4.12+ needs numpy 2, which breaks the pin above
+pyyaml                 # rclpy needs it when ROS is used from this env (feetech_mirror.py)
+
+# cameras + geometry (pip picks a build that fits the pinned numpy)
+opencv-python
+
+# WiLoR (Computer-Vision/WiLoR/; weights + MANO in WiLoR/repo/, copied by hand, never committed)
+torch==2.5.1
+torchvision==0.20.1
+ultralytics==8.1.34    # the YOLO hand detector (repo/pretrained_models/detector.pt)
+pytorch-lightning
+smplx==0.1.28
+timm
+einops
+yacs
+pyrender               # imported by the WiLoR package (rendering, unused here)

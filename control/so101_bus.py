@@ -5,14 +5,32 @@ out of base_pose.py for the real-time loop (feetech_mirror.py). The older
 standalone scripts keep their own copies and still work unchanged.
 
 Not a script; import it:
-    from so101_bus import Bus, NAMES, rad_to_ticks, ticks_to_rad
+    from so101_bus import Bus, NAMES, rad_to_ticks, ticks_to_rad, default_port
 """
+import glob
 import math
 import sys
 
 import scservo_sdk as scs
 
 BAUD = 1_000_000
+
+# macOS names USB serial adapters /dev/cu.* (use cu., not tty.: tty. waits for a carrier
+# signal). CDC-ACM boards are cu.usbmodem*, CH34x / FTDI bridges cu.usbserial* / cu.wchusbserial*.
+PORT_GLOBS = ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.wchusbserial*")
+PORT_HELP = "servo board serial port (default: the one USB serial device in /dev/cu.*)"
+
+
+def default_port():
+    """The servo board's serial port: the only USB serial device present. Exits with
+    the candidates if there are none or several (then pass --port)."""
+    found = sorted({p for g in PORT_GLOBS for p in glob.glob(g)})
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        sys.exit("no USB serial device (/dev/cu.usbmodem*, /dev/cu.usbserial*): is the servo board "
+                 "plugged in and powered? (ls /dev/cu.*)")
+    sys.exit(f"several USB serial devices, pick one with --port: {', '.join(found)}")
 NAMES = {1: "shoulder_pan", 2: "shoulder_lift", 3: "elbow_flex",
          4: "wrist_flex", 5: "wrist_roll", 6: "gripper"}
 IDS = {name: sid for sid, name in NAMES.items()}
@@ -93,7 +111,8 @@ def ticks_to_rad(name, ticks):
 
 
 class Bus:
-    def __init__(self, port_name):
+    def __init__(self, port_name=None):
+        port_name = port_name or default_port()
         self.port = scs.PortHandler(port_name)
         self.pkt = scs.PacketHandler(0)  # protocol 0 = STS series
         try:
@@ -102,7 +121,7 @@ class Bus:
             print(e)
             opened = False
         if not opened:
-            sys.exit(f"could not open {port_name} (attached via usbipd? chmod 666?)")
+            sys.exit(f"could not open {port_name} (in use by another script? unplug and replug the board)")
         if not self.port.setBaudRate(BAUD):
             sys.exit(f"could not set baud {BAUD}")
         self.sync = scs.GroupSyncWrite(self.port, self.pkt, GOAL_POSITION, 2)

@@ -1,7 +1,7 @@
 """Irregular /ball_position targets -> evenly paced IK targets. Pure numpy.
 
 Targets arrive at the camera rate (13-30 Hz, irregular: dropped frames,
-MediaPipe time varies), while the IK solves on a fixed timer. Taking the
+landmark model time varies), while the IK solves on a fixed timer. Taking the
 latest target each tick re-solves the same target on some ticks and skips one
 on others, so the arm gets uneven steps. TargetInterpolator samples the target
 path `delay` seconds behind real time instead, linearly between the two

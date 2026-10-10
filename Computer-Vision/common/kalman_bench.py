@@ -1,7 +1,7 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Offline benchmark of the position filters (hand_mapping) on logged hand positions.
 
-    .venv/bin/python Computer-Vision/common/kalman_bench.py [--logs DIR] [--backend wilor]
+    python Computer-Vision/common/kalman_bench.py [--logs DIR] [--backend wilor]
 
 Windows: DIR/windows.json ({"take": [start, end] or null}) if present, else
 WINDOWS (the baseline recordings). An explicit window scores every frame with a
@@ -14,8 +14,7 @@ without the mapping / box / speed caps after it, so it isolates the filter.
 filter_eval.py scores the whole published output instead.
 
 Reference: a zero-lag (acausal) local polynomial fit over +-REF_S seconds
-(9 frames, cubic, at MediaPipe's ~30 Hz; 5 frames, quadratic, at WiLoR's
-~16 Hz), which a live filter can't do because it sees future frames. The
+(9 frames, cubic, at ~30 Hz; 5 frames, quadratic, at WiLoR's ~16 Hz), which a live filter can't do because it sees future frames. The
 window is in seconds so both frame rates get the same reference smoothness. Scores against it:
     still jit   RMS error while the reference is slower than 3 cm/s (mm)
     still wob   output jitter on the still take, as filter_eval measures it (mm):
@@ -41,7 +40,8 @@ import filter_eval as fe
 from hand_mapping import IMM_PRESETS, KALMAN_DEFAULTS, OneEuro, StereoIMM, StereoKalman
 from stereo_cam import HERE, RIG_PATH, load_rig
 
-# scoring windows (s from the log's first frame), see recordings/baseline/README.md
+# scoring windows (s from the log's first frame) of the old MediaPipe baseline recordings (on
+# ik-improvements); logs with a windows.json (recordings/wilor/wl) use that instead
 WINDOWS = {"still": (24.5, 38.5), "sweep": (35.5, 53), "reach": (25.1, 58.6), "drop_out": (28.5, 47)}
 REF_S = 0.135  # reference fit half-width (s): +-4 frames at 30 Hz, as before
 SLOW = 0.03  # m/s
@@ -160,7 +160,7 @@ def bench(segs, make):
     return res
 
 
-def filters(f, B, backend="mediapipe"):
+def filters(f, B, backend="wilor"):
     def euro():
         e = OneEuro(1.0, 2.0)
         return lambda p, t, err=None, mono=False: e(p, t)
@@ -171,14 +171,12 @@ def filters(f, B, backend="mediapipe"):
             return lambda p, t, err=None, mono=False: m(p, t, err, mono)[0]
         return factory
 
+    kf = KALMAN_DEFAULTS[backend]
     out = [("one-euro (1 Hz, beta 2)", euro),
-           ("kalman (sigma 4, q 0.001)", wrap(lambda: StereoKalman(f, B)))]
-    out += [(f"imm {name}", wrap(lambda kw=kw: StereoIMM(f, B, **kw))) for name, kw in IMM_PRESETS["mediapipe"].items()]
-    if backend != "mediapipe":  # its own tuning next to the MediaPipe one
-        kf = KALMAN_DEFAULTS[backend]
-        out += [(f"kalman {backend} (s {kf['sigma_px']:g}, q {kf['q']:g})", wrap(lambda: StereoKalman(f, B, **kf)))]
-        out += [(f"imm {backend} {name}", wrap(lambda kw=kw: StereoIMM(f, B, **kw)))
-                for name, kw in IMM_PRESETS[backend].items()]
+           ("kalman (sigma 4, q 0.001)", wrap(lambda: StereoKalman(f, B))),  # untuned reference
+           (f"kalman {backend} (s {kf['sigma_px']:g}, q {kf['q']:g})", wrap(lambda: StereoKalman(f, B, **kf)))]
+    out += [(f"imm {backend} {name}", wrap(lambda kw=kw: StereoIMM(f, B, **kw)))
+            for name, kw in IMM_PRESETS[backend].items()]
     return out
 
 
@@ -188,10 +186,10 @@ COLS = (("still", "jit"), ("still", "wob"), ("sweep", "err"), ("sweep", "lag"), 
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--logs", default=os.path.join(HERE, "recordings", "baseline"))
+    ap.add_argument("--logs", default=os.path.join(HERE, "recordings", "wilor", "wl"))
     ap.add_argument("--ref-s", type=float, default=REF_S, help="reference fit half-width (s)")
-    ap.add_argument("--backend", default="mediapipe", choices=sorted(IMM_PRESETS),
-                    help="also score this backend's own presets (hand_mapping.IMM_PRESETS)")
+    ap.add_argument("--backend", default="wilor", choices=sorted(IMM_PRESETS),
+                    help="score this backend's presets (hand_mapping.IMM_PRESETS)")
     args = ap.parse_args()
     globals()["REF_S"] = args.ref_s
     rig = load_rig(RIG_PATH)

@@ -1,4 +1,4 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Drive the real SO-ARM101 from the ROS topics /arm/<joint> (radians, URDF).
 
 Subscribes to /arm/shoulder_pan, /arm/shoulder_lift, /arm/elbow_flex,
@@ -15,8 +15,9 @@ like base_pose.py). Only then does it start following /arm/*. IK home
 down from there, so with the target at home the IK output moves the arm there
 (lift -51, elbow +64, wrist_flex -13 deg) right after homing, rate limited.
 
-Needs ROS sourced so the venv python can import rclpy:
-    source /opt/ros/jazzy/setup.bash
+Run it with the conda env that has ROS 2 Jazzy (macOS), from any folder:
+    conda activate ros2_jazzy      # the servo port is found automatically (/dev/cu.usbmodem*),
+                                  # or pass --port /dev/cu.usbmodemXXXX
     ./feetech_mirror.py                     # DRY RUN (default): reads the arm,
                                             # prints planned ticks, no torque
     ./feetech_mirror.py --live              # asks, torque on, homes, then follows
@@ -64,7 +65,7 @@ try:
     from sensor_msgs.msg import JointState
     from std_msgs.msg import Float64
 except ImportError as e:
-    sys.exit(f"{e}\nsource /opt/ros/jazzy/setup.bash first (and pip install -r ~/kh/requirements.txt)")
+    sys.exit(f"{e}\nactivate the conda env with ROS 2 Jazzy first (and pip install -r ~/kh/requirements.txt in it)")
 
 import so101_bus as sb
 
@@ -193,7 +194,7 @@ def home(bus, sids, start, speed, dt):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=None, help=sb.PORT_HELP)
     ap.add_argument("--live", action="store_true", help="enable torque and move (default: dry run)")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt (with --live)")
     ap.add_argument("--no-bus", action="store_true", help="dry run without the arm attached")

@@ -1,4 +1,4 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Stereo hand geometry: pure numpy/OpenCV math, no cameras, no ROS.
 
 Frames:
@@ -8,7 +8,7 @@ Frames:
             A (3x3, rows = robot axes expressed in cam coords) maps
             cam vectors to robot vectors: v_robot = A @ v_cam.
 
-Hand frame (from MediaPipe's 21 landmarks, triangulated to 3D):
+Hand frame (from the backend's 21 landmarks, OpenPose order, triangulated to 3D):
     origin = centroid of palm points {0 wrist, 5, 9, 13, 17 MCPs}
     x = wrist -> middle MCP (0 -> 9), where the hand points
     z = palm normal (5 - 0) x (17 - 0); the sign flips with chirality,
@@ -16,7 +16,7 @@ Hand frame (from MediaPipe's 21 landmarks, triangulated to 3D):
     y = z x x
 
 Self-test (synthetic stereo, no hardware):
-    .venv/bin/python Computer-Vision/common/hand3d.py
+    python Computer-Vision/common/hand3d.py
 """
 import math
 

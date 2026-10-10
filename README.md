@@ -1,110 +1,110 @@
-# kh: hand-tracked SO-ARM101
+# kh: hand-tracked SO-ARM101 (macOS, `mac-version` branch)
 
 Computer vision tracks a hand, and the SO-ARM101 robot arm follows it.
 
-- `control/`: talks to the arm's Feetech STS3215 servos (Python venv).
-- `ros_ws/src/so101_mirror/`: ROS 2 Jazzy package: Gazebo target ball → IK → `/arm/<joint>` commands.
-- `INTEGRATION.md`: topic contract, how the pieces connect, calibration status. Read it after setup.
+- `control/`: talks to the arm's Feetech STS3215 servos.
+- `ros_ws/src/so101_mirror/`: ROS 2 Jazzy package: target → IK → `/arm/<joint>` commands (+ an optional Gazebo ball sim).
+- `Computer-Vision/`: stereo hand tracking with the WiLoR (MANO) hand model → `/ball_position` + `/gripper`.
+- `INTEGRATION.md`: topic contract, how the pieces connect, calibration status. `MAC_INTEGRATION.md`: what changed for the Mac and the bring-up order.
+
+This branch runs on macOS only (Apple silicon: AVFoundation cameras, the Apple GPU via PyTorch MPS,
+`/dev/cu.*` serial ports). The Linux/WSL setup is on `ik-improvements`.
 
 ## Requirements
 
-- Ubuntu 24.04 (native or WSL2). ROS 2 Jazzy targets 24.04 only.
-- Python 3.12 (the Ubuntu 24.04 system Python).
-- The arm's USB servo board, if you're driving real hardware.
+- A Mac with Apple silicon (written for a MacBook Pro M5 Pro).
+- ROS 2 Jazzy in a conda environment (RoboStack, `robostack-jazzy` + `conda-forge` channels).
+- The arm's USB servo board and two USB webcams (Adesso CyberTrack H4), each on its own USB port.
+- `Computer-Vision/WiLoR/repo/` (the WiLoR code, `pretrained_models/`, `mano_data/`): not in git,
+  copy it from the old machine. MANO is under a non-commercial license: never commit or upload it.
 
-## 1. ROS 2 Jazzy + Gazebo
+## 1. ROS 2 Jazzy (conda)
 
-Follows the [official Jazzy install guide](https://docs.ros.org/en/jazzy/Installation/Ubuntu-Install-Debs.html).
-
-```bash
-# locale + universe repo
-sudo apt update && sudo apt install -y locales software-properties-common curl
-sudo locale-gen en_US en_US.UTF-8
-sudo update-locale LC_ALL=en_US.UTF-8 LANG=en_US.UTF-8
-sudo add-apt-repository -y universe
-
-# ROS apt source
-export ROS_APT_SOURCE_VERSION=$(curl -s https://api.github.com/repos/ros-infrastructure/ros-apt-source/releases/latest | grep -F "tag_name" | awk -F\" '{print $4}')
-curl -L -o /tmp/ros2-apt-source.deb "https://github.com/ros-infrastructure/ros-apt-source/releases/download/${ROS_APT_SOURCE_VERSION}/ros2-apt-source_${ROS_APT_SOURCE_VERSION}.$(. /etc/os-release && echo $VERSION_CODENAME)_all.deb"
-sudo dpkg -i /tmp/ros2-apt-source.deb
-
-# ROS, Gazebo (Harmonic, via ros_gz), and the packages so101_mirror uses
-sudo apt update
-sudo apt install -y ros-jazzy-desktop ros-dev-tools \
-  ros-jazzy-ros-gz ros-jazzy-xacro python3-numpy
-```
-
-Load ROS in every new terminal (or add it to `~/.bashrc`):
+Every terminal: `conda activate ros2_jazzy` (or `micromamba activate`). Check it has what's needed:
 
 ```bash
-source /opt/ros/jazzy/setup.bash
+python -c "import rclpy, std_msgs.msg, numpy; print('ok', numpy.__version__)"
+ros2 pkg list | grep -E "^(std_msgs|geometry_msgs|xacro)$"
+# missing ones / build tools:
+conda install -c robostack-jazzy -c conda-forge ros-jazzy-xacro ros-jazzy-geometry-msgs \
+    compilers cmake pkg-config make ninja colcon-common-extensions
 ```
+
+If nodes on the same Mac don't see each other's topics: `export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
+in every terminal. Allow the macOS firewall prompt.
 
 ## 2. Build the ROS workspace
 
 ```bash
 cd ~/kh/ros_ws
-rosdep init 2>/dev/null; rosdep update          # first time only (`sudo rosdep init` if it asks)
-rosdep install --from-paths src --ignore-src -y  # pulls any missing deps from package.xml
 colcon build --symlink-install
-source install/setup.bash                        # every new terminal, after /opt/ros/jazzy
+source install/setup.zsh     # every new terminal, after activating the env (zsh is the macOS default)
 ```
 
-`--symlink-install` makes edits to Python scripts take effect without rebuilding. Rebuild after you add new files.
+`--symlink-install` makes edits to Python scripts take effect without rebuilding. Rebuild after you add
+new files. Gazebo (`ros-jazzy-ros-gz`) is only needed for the ball sim (`sim.launch.py`), not for the arm.
 
-## 3. Python venv (servo control + hand tracking)
+## 3. Python packages (same conda env)
 
 ```bash
 cd ~/kh
-sudo apt install -y python3-venv
-python3 -m venv .venv
-.venv/bin/pip install --upgrade pip
-.venv/bin/pip install -r requirements.txt
+python -c "import numpy; print(f'numpy=={numpy.__version__}')" > /tmp/numpy-pin.txt
+pip install -r requirements.txt -c /tmp/numpy-pin.txt
+pip install --no-build-isolation git+https://github.com/mattloper/chumpy
+python -c "import torch; print('MPS', torch.backends.mps.is_available())"   # must say True
 ```
 
-`requirements.txt` pins `numpy==1.26.4` to match the numpy ROS Jazzy was built against. Don't upgrade numpy or OpenCV in the venv, or ROS messages break when the venv runs a ROS node (`feetech_mirror.py`).
+The numpy pin keeps conda's numpy: ROS's messages are built against it, and pip must not replace it.
 
-The `control/` scripts have the shebang `#!/home/peyton/kh/.venv/bin/python`. If your checkout is somewhere else, run them as `.venv/bin/python control/<script>.py` instead.
+## 4. Devices
 
-## 4. Connect the arm (WSL2 only)
-
-WSL can't see USB devices until you pass them in. In an **admin PowerShell** on Windows:
-
-```powershell
-winget install usbipd      # first time only
-usbipd list                # find the servo board's BUSID
-usbipd bind --busid <BUSID>     # first time only
-usbipd attach --wsl --busid <BUSID>
-```
-
-Then in WSL:
-
-```bash
-ls /dev/ttyACM0             # missing = board not attached
-sudo chmod 666 /dev/ttyACM0 # needed after every attach
-```
-
-On native Linux, add yourself to the `dialout` group instead (`sudo usermod -aG dialout $USER`, then log out and back in).
+- **Servo board:** shows up as `/dev/cu.usbmodem…` (or `/dev/cu.usbserial…`). The control scripts find
+  it automatically when it's the only one; otherwise pass `--port /dev/cu.usbmodemXXXX` (`ls /dev/cu.*`).
+- **Cameras:** the terminal app needs camera access (System Settings → Privacy & Security → Camera).
+  Turn off iPhone Continuity Camera while working. Find the camera numbers:
+  ```bash
+  python Computer-Vision/common/stereo_cam.py --list
+  ```
+  Then pass `--cams LEFT RIGHT` to `stereo_cam.py`, `stereo_calib.py` and `hand_target_node.py`
+  (default `1 2`; cam0 = the left camera). Two identical H4s can swap numbers between plug-ins: check.
+- **Focus:** the H4s have manual focus rings. Set them in the preview
+  (`stereo_cam.py --cams L R --no-landmarks` shows each view's sharpness: same textured target in
+  both, turn until the number peaks), then tape them. Recalibrate after turning one.
 
 ## 5. Check that it works
 
 ```bash
 # servos: scan IDs 1–6 and print position/load/voltage/temp (no motion)
-.venv/bin/python control/servo_raw.py
+python control/servo_raw.py
 
-# sim: Gazebo ball → IK (drag the ball with the T/R tools)
-ros2 launch so101_mirror sim.launch.py
+# WiLoR on the Apple GPU (demo images, no cameras), then its speed
+python Computer-Vision/WiLoR/wilor_landmarks.py
+python Computer-Vision/WiLoR/bench_wilor.py
 
-# second terminal: IK → servo ticks, dry run (doesn't move the arm)
-source /opt/ros/jazzy/setup.bash
-.venv/bin/python control/feetech_mirror.py --no-bus
+# cameras + hand landmarks
+python Computer-Vision/common/stereo_cam.py --cams L R
+
+# stereo calibration (once per camera mount / focus ring change; see the script's docstring)
+python Computer-Vision/common/stereo_calib.py --board --square-mm 20 --cams L R
+
+# IK → servo ticks, dry run (doesn't move the arm)
+ros2 run so101_mirror ik_node.py
+python control/feetech_mirror.py --no-bus
 ```
 
-For running the full pipeline, the `--live` mode, and calibration, see `INTEGRATION.md`. Before you run anything that moves the arm, read the safety rules in `control/CLAUDE.md`.
+For the full pipeline, the `--live` mode and calibration, see `INTEGRATION.md` and
+`MAC_INTEGRATION.md`. Before you run anything that moves the arm, read the safety rules in
+`control/CLAUDE.md`.
 
 ## Troubleshooting
 
-- **`ros2: command not found`**: you didn't source `/opt/ros/jazzy/setup.bash` in this terminal.
-- **`Package 'so101_mirror' not found`**: you didn't source `ros_ws/install/setup.bash`, or the build failed.
-- **numpy / `_ARRAY_API` errors when a venv script imports `rclpy`**: numpy in the venv isn't 1.26.x. Run `.venv/bin/pip install -r requirements.txt` again.
-- **IK jumps between solutions**: two sims are running on the same machine. Use `export ROS_DOMAIN_ID=77 GZ_PARTITION=test` to isolate one.
+- **`ros2: command not found`**: the conda env isn't active in this terminal.
+- **`Package 'so101_mirror' not found`**: you didn't source `ros_ws/install/setup.zsh`, or the build failed.
+- **numpy / `_ARRAY_API` errors when importing `rclpy`**: pip replaced conda's numpy. Reinstall it
+  with conda (`conda install numpy=<the version ROS came with>`) and redo step 3 with the pin.
+- **`camera N: no frames`**: wrong index (`--list`), camera access not granted, or the camera is in
+  use by another app.
+- **`SLOW CAMERA`**: both cameras on one hub, or a dark room (auto exposure gets longer).
+- **WiLoR very slow / `WARNING: WiLoR on the CPU`**: torch has no MPS (`torch.backends.mps.is_available()`).
+  An op missing on MPS: run with `PYTORCH_ENABLE_MPS_FALLBACK=1`, or `--wilor-fp32`.
+- **IK jumps between solutions**: two IK nodes / sims are running. Use `export ROS_DOMAIN_ID=77` to isolate one.

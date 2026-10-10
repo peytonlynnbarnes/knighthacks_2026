@@ -20,3 +20,7 @@ Computer-Vision/WiLoR/.venv/
 /edge-on/
 /cam_bug/
 /frames_*/
+
+# macOS (mac-version)
+.DS_Store
+*.pyc

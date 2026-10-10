@@ -1,18 +1,20 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """One-time stereo calibration -> Computer-Vision/common/calib/stereo.npz.
 
 Redo it whenever a camera is bumped or re-aimed, and to change resolution.
 
-Resolution: --size (default 640x480, a 4:3 center crop, ~38 deg; 1280x720 is
-the full ~50 deg view but cam0 only manages ~5 fps at it in normal light,
-USB bandwidth through usbipd, so check the fps the startup line prints). The
-rig file records the size and hand_target_node.py opens the cameras at it. Focus: find the sharpest value for a hand at working
-distance with stereo_cam.py (f key), then calibrate with --focus N. It's
-locked during calibration and saved in the rig, and the node locks the same
-value (autofocus changes the focal length the calibration measured).
+Cameras: --cams LEFT RIGHT, the AVFoundation indices (find them with
+stereo_cam.py --list); cam0 = the left camera. Resolution: --size (default
+640x480; on Linux this was a 4:3 center crop, ~38 deg; 1280x720 showed ~50 deg
+but was too slow through usbipd: check the fps the startup line prints, it may
+work natively on the Mac). The rig file records the size and
+hand_target_node.py opens the cameras at it. Focus: the H4s have manual focus
+rings. Set them first (stereo_cam.py shows the sharpness of each view) and
+don't touch them afterwards: turning a ring changes the focal length the
+calibration measured.
 
 Mode 1 (default, no equipment): calibrate from your hand.
-    .venv/bin/python Computer-Vision/common/stereo_calib.py [--hfov 38]   (default 38 at 640x480, 50 at 1280x720)
+    python Computer-Vision/common/stereo_calib.py --cams L R [--hfov 38]   (default 38 at 640x480, 50 at 1280x720)
     Move an open hand slowly all around the shared view for ~25 s: left/right,
     up/down, near/far (30-90 cm), and tilt it. The essential matrix from those
     landmark matches gives cam1's rotation and direction; the measured
@@ -21,11 +23,11 @@ Mode 1 (default, no equipment): calibrate from your hand.
     motion (what the arm uses, 1:1) is what matters.
 
 Mode 2 (more accurate): a chessboard shown on a phone/tablet screen.
-    .venv/bin/python Computer-Vision/common/stereo_calib.py --board
+    python Computer-Vision/common/stereo_calib.py --board
         -> writes calib/chessboard.png (9x6 inner corners = 10x7 squares) and exits.
     Show it full screen on the phone at max brightness, measure the width of
     all 10 squares in a row with a ruler and divide by 10, then:
-    .venv/bin/python Computer-Vision/common/stereo_calib.py --board --square-mm 9.8
+    python Computer-Vision/common/stereo_calib.py --board --square-mm 9.8 --cams L R
     Hold the phone still for each grab (blur kills detection). Two kinds of views:
       1. per camera (15 each, 6 of them TILTED 20-40 deg): hold the phone close
          (15-40 cm) to one camera so it fills much of that view; corners of the
@@ -56,7 +58,7 @@ import cv2
 import numpy as np
 
 import hand3d as h3
-from stereo_cam import (BACKENDS, BASELINE_M, HERE, RIG_PATH, StereoCam, make_landmarks,
+from stereo_cam import (BACKENDS, BASELINE_M, DEFAULT_CAMS, HERE, RIG_PATH, StereoCam, make_landmarks,
                         draw_hand, fit_view, save_rig)
 
 BOARD = (9, 6)  # inner corners
@@ -252,8 +254,7 @@ def capture_board(cam, args):
     os.makedirs(os.path.dirname(CORNERS_PATH), exist_ok=True)
     np.savez(CORNERS_PATH, v0=np.array(views[0]), v1=np.array(views[1]),
              p0=np.array([p[0] for p in pairs]), p1=np.array([p[1] for p in pairs]),
-             square_mm=args.square_mm, size=np.array(cam.size),
-             focus=-1 if args.focus is None else args.focus)
+             square_mm=args.square_mm, size=np.array(cam.size), focus=-1)
     print(f"saved corners to {CORNERS_PATH} (re-solve with --from-corners)")
     return [np.array(v) for v in views], pairs, cam.size
 
@@ -333,14 +334,12 @@ def solve_board(views, pairs, size, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cams", type=int, nargs=2, default=[0, 2])
-    ap.add_argument("--backend", choices=BACKENDS, default="mediapipe",
+    ap.add_argument("--cams", type=int, nargs=2, default=DEFAULT_CAMS, metavar=("LEFT", "RIGHT"),
+                    help="AVFoundation indices: cam0 = left camera, cam1 = right (stereo_cam.py --list)")
+    ap.add_argument("--backend", choices=BACKENDS, default="wilor",
                     help="landmark backend for the hand-based calibration (not --board)")
     ap.add_argument("--size", type=int, nargs=2, default=[640, 480], metavar=("W", "H"),
                     help="capture size; the node uses whatever the rig was calibrated at")
-    ap.add_argument("--focus", type=int, default=None,
-                    help="lock focus 0..1023 (from stereo_cam.py's f sweep) and save it in the "
-                         "rig (default autofocus, not recommended)")
     ap.add_argument("--fix-center", action="store_true",
                     help="board mode: pin the principal point to the image center")
     ap.add_argument("--hfov", type=float, default=None,
@@ -371,12 +370,10 @@ def main():
             print(f"note: corners were captured with --square-mm {float(z['square_mm'])}")
         res, problems = solve_board([z["v0"], z["v1"]], list(zip(z["p0"], z["p1"])), z["size"], args)
         size = tuple(int(v) for v in z["size"])
-        if "focus" in z.files and args.focus is None and int(z["focus"]) >= 0:
-            args.focus = int(z["focus"])
     else:
         cam = StereoCam(args.cams, size=args.size)
         size = cam.size
-        print("cameras:", cam.configure(focus=args.focus))
+        print("cameras:", cam.configure())
         try:
             if args.board:
                 views, pairs, _ = capture_board(cam, args)
@@ -391,7 +388,7 @@ def main():
             sys.exit(f"not saved (fix and rerun; or --force). Re-solve without recapturing: "
                      f"--board --square-mm {args.square_mm} --from-corners")
     K0, d0, K1, d1, R, t, method = res
-    save_rig(args.out, K0, d0, K1, d1, R, t, size, method, focus=args.focus)
+    save_rig(args.out, K0, d0, K1, d1, R, t, size, method)
     print(f"saved {args.out}")
 
 

@@ -1,4 +1,4 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Record SO-ARM101 joint positions to CSV while you move the arm by hand.
 
 READ ONLY: never writes any register, never touches torque. Torque should
@@ -46,7 +46,7 @@ def summarize(path, since=None, until=None):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=None, help=sb.PORT_HELP)
     ap.add_argument("--out", help="CSV path (default calib/range_<time>.csv next to this script)")
     ap.add_argument("--rate", type=float, default=20.0)
     ap.add_argument("--summary", metavar="CSV", help="print min/max of an existing recording and exit")

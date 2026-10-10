@@ -1,7 +1,7 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Score hand -> target smoothing from hand_target_node.py --log files. No cameras, no ROS.
 
-    .venv/bin/python Computer-Vision/common/filter_eval.py out.npz [more.npz ...] [--window 20 37]
+    python Computer-Vision/common/filter_eval.py out.npz [more.npz ...] [--window 20 37]
 
 Record a test motion once (hand_target_node.py --record rec.npz), then replay it
 through each filter variant (--replay rec.npz --no-ros --log variant.npz) and

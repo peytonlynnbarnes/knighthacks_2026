@@ -1,4 +1,4 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Low-level Feetech STS3215 control for the SO-ARM101 via scservo_sdk.
 
 Scans IDs 1-6, prints state, then nudges one joint by a small step and
@@ -13,6 +13,8 @@ import sys
 import time
 
 import scservo_sdk as scs
+
+from so101_bus import PORT_HELP, default_port
 
 BAUD = 1_000_000
 NAMES = {1: "shoulder_pan", 2: "shoulder_lift", 3: "elbow_flex",
@@ -59,10 +61,11 @@ def move_and_wait(pkt, port, sid, goal, tol=15, timeout=3.0):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=None, help=PORT_HELP)
     ap.add_argument("--id", type=int, help="servo ID to nudge (omit to scan only)")
     ap.add_argument("--step", type=int, default=100, help="ticks to nudge (4096 = 360 deg)")
     args = ap.parse_args()
+    args.port = args.port or default_port()
 
     if args.id is not None and abs(args.step) > 300:
         sys.exit("refusing step > 300 ticks (~26 deg); edit the script if you really mean it")
@@ -75,7 +78,7 @@ def main():
         opened = False
         print(e)
     if not opened:
-        sys.exit(f"could not open {args.port} (is the board attached to WSL via usbipd?)")
+        sys.exit(f"could not open {args.port} (in use by another script? unplug and replug the board)")
     if not port.setBaudRate(BAUD):
         sys.exit(f"could not set baud {BAUD}")
 

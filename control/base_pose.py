@@ -1,4 +1,4 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Move the SO-ARM101 to its base pose: every joint at 2048 (calibration middle).
 
 All joints move together along a straight line in joint space at a slow,
@@ -23,6 +23,8 @@ import sys
 import time
 
 import scservo_sdk as scs
+
+from so101_bus import PORT_HELP, default_port
 
 BAUD = 1_000_000
 NAMES = {1: "shoulder_pan", 2: "shoulder_lift", 3: "elbow_flex",
@@ -53,7 +55,7 @@ class Bus:
         self.port = scs.PortHandler(port_name)
         self.pkt = scs.PacketHandler(0)
         if not self.port.openPort():
-            sys.exit(f"could not open {port_name} (attached via usbipd? chmod 666?)")
+            sys.exit(f"could not open {port_name} (in use by another script? unplug and replug the board)")
         if not self.port.setBaudRate(BAUD):
             sys.exit(f"could not set baud {BAUD}")
         self.sync = scs.GroupSyncWrite(self.port, self.pkt, GOAL_POSITION, 2)
@@ -102,7 +104,7 @@ class Bus:
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=None, help=PORT_HELP)
     ap.add_argument("--joints", type=int, nargs="+", default=list(NAMES),
                     help="joint IDs to move (default: all)")
     ap.add_argument("--speed", type=float, default=150,
@@ -110,6 +112,7 @@ def main():
     ap.add_argument("--dry-run", action="store_true", help="print the plan only")
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     args = ap.parse_args()
+    args.port = args.port or default_port()
 
     if not 0 < args.speed <= MAX_SPEED:
         sys.exit(f"--speed must be in (0, {MAX_SPEED}]")

@@ -1,4 +1,4 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Hand pose (cam frame) -> /ball_position offset [x y z roll pitch yaw]. Pure, no ROS.
 
 out_p = anchor_out_p + scale * A (p - anchor_hand_p)          (meters, base_link axes)
@@ -8,7 +8,7 @@ the vision input (re-acquired hand, bad frame) can't make the target jump.
 
 Orientation (hand rotation from the calibrated neutral, robot axes):
   1. Frames where the palm is turned nearly edge-on to the cameras (where
-     MediaPipe gets noisy, then loses the hand) count less, and the rotation
+     the landmarks get noisy, then the hand is lost) count less, and the rotation
      holds once the palm is past FACING_DEG[0] from facing the cameras.
   2. One-euro filter on the hand rotation (before the gain, so the filter
      sees real hand speed): strong smoothing when still, little when turning.
@@ -26,7 +26,7 @@ first frame back into a permanent offset on every clutch, so rpy drifted
 (simulated: ~10-100 deg after 20 clutches); a turned hand now just rotates
 the gripper back at the slew limit.
 
-Self-test: .venv/bin/python Computer-Vision/common/hand_mapping.py
+Self-test: python Computer-Vision/common/hand_mapping.py
 """
 import math
 
@@ -188,23 +188,16 @@ class StereoKalman:
         return self.x[:3].copy(), self.x[3:].copy()
 
 
-# StereoIMM settings, tuned offline on the recordings (scored against a zero-lag
-# reference, kalman_bench.py). vs a single StereoKalman (sigma 4, q 0.001):
-#   smooth:     everything equal or better (drop-out error -17%, sweep -11%), same roughness
-#   responsive: tracking error and overshoot about halved, lag 35 -> 22 ms on reaches,
-#               ~35% more acceleration (roughness) while moving
-# Separate per landmark backend. WiLoR (tuned 2026-10-10 on recordings/wilor/, WiLoR's own
-# frames at its live ~15 Hz, kalman_bench --ref-s 0.25): its noise is higher on a still hand
-# but barely grows with speed, so low, flat noise (speed_k 0) and a very sticky still model.
-# vs the MediaPipe smooth preset on the same WiLoR data:
+# StereoIMM / single StereoKalman settings per landmark backend, tuned offline on the
+# recordings (scored against a zero-lag reference, kalman_bench.py). WiLoR (tuned 2026-10-10
+# on recordings/wilor/, WiLoR's own frames at its live ~15 Hz, kalman_bench --ref-s 0.25): its
+# noise is higher on a still hand but barely grows with speed, so low, flat noise (speed_k 0)
+# and a very sticky still model. vs the earlier MediaPipe smooth preset (sigma 4, ray 8,
+# speed_k 0.005, p_stay 0.8) on the same WiLoR data:
 #   smooth:     tracking error about halved (sweep 5.4 -> 2.7 mm, drop-out 10.1 -> 3.3),
 #               lag 20-56 -> 5-13 ms, still-hand wobble 0.56 -> 0.31 mm
 #   responsive: drop-out error a further -10%, ~5 ms less lag, still wobble 0.40 mm
 IMM_PRESETS = {
-    "mediapipe": {
-        "smooth": dict(sigma_px=4.0, ray_px=8.0, speed_k=0.005, q=(1e-6, 0.01), p_stay=0.8),
-        "responsive": dict(sigma_px=2.0, ray_px=4.0, speed_k=0.005, q=(1e-6, 0.01), p_stay=0.8),
-    },
     "wilor": {
         "smooth": dict(sigma_px=1.5, ray_px=1.5, speed_k=0.0, q=(1e-6, 0.01), p_stay=0.995),
         "responsive": dict(sigma_px=1.0, ray_px=1.0, speed_k=0.0, q=(1e-6, 0.01), p_stay=0.99),
@@ -212,7 +205,6 @@ IMM_PRESETS = {
 }
 # single StereoKalman (--pos-filter kalman) defaults per backend
 KALMAN_DEFAULTS = {
-    "mediapipe": dict(sigma_px=4.0, q=0.001),
     "wilor": dict(sigma_px=1.0, q=0.0001),  # vs (4, 0.001): moving error -45..65%, still equal
 }
 
@@ -634,8 +626,8 @@ def _selftest():
             imm(pk, k / 30)
         xs = [imm(pk + [0.1, 0, 0], k / 30)[0][0] for k in range(30, 60)]
         # WiLoR's low noise settings overshoot this instant 10 cm step by ~12 mm (on its real
-        # reaches they overshoot less than the MediaPipe presets: 4.6 vs 7.2 mm)
-        max_ov = 0.11 if backend == "mediapipe" else 0.115
+        # reaches they overshoot less than the old MediaPipe presets did: 4.6 vs 7.2 mm)
+        max_ov = 0.115
         assert abs(xs[5] - 0.1) < 0.01 and max(xs) < max_ov and abs(xs[-1] - 0.1) < 0.002, (preset, xs)
     # StillHold: freezes a still hand, releases on motion without a step
     sh = StillHold()

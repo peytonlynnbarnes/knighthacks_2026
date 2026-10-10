@@ -25,7 +25,7 @@ Steps (instructions are shown in the preview window):
  7. FINAL: hand back at the start, palm to the cameras. Then tracking begins.
 
 Runs at every hand_target_node.py start (the calibration hand is the origin);
-calib/hand.json is a record of the last one, not reloaded.
+calib/hand_wilor.json is a record of the last one, not reloaded.
 The axes depend on how the cameras are mounted, so redo it if they move.
 """
 import json
@@ -38,13 +38,13 @@ import hand3d as h3
 from hand_mapping import FACING_DEG, facing_weight
 from stereo_cam import HERE
 
-HAND_PATH = os.path.join(HERE, "calib", "hand.json")
+HAND_PATH = os.path.join(HERE, "calib", "hand_wilor.json")
 
 
-def hand_path(backend="mediapipe"):
-    """Bone lengths, palm template and flat-hand curl depend on the landmark
-    backend, so each keeps its own record: hand.json (MediaPipe), hand_<backend>.json."""
-    return HAND_PATH if backend == "mediapipe" else os.path.join(HERE, "calib", f"hand_{backend}.json")
+def hand_path(backend="wilor"):
+    """Where the hand calibration is saved (a record, not reloaded). Per landmark
+    backend, so each keeps its own record: calib/hand_<backend>.json."""
+    return os.path.join(HERE, "calib", f"hand_{backend}.json")
 
 
 class HandCalibrator:

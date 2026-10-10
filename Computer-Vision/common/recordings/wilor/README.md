@@ -3,10 +3,13 @@
 Frames: `~/kh/{still,sweep,reach,drop-out,edge-on}/` (`--record-frames`, recorded live with
 `--backend wilor`, so 11–16 pairs/s: the rate WiLoR runs at live). Not in git (~2 MB/s).
 
-- `lm_wl_<take>.npz` / `lm_mp_<take>.npz`: landmarks from each backend on those frames (`--record`),
-  `extract_*.txt` their console output. `--replay lm_wl_<take>.npz` reruns the pipeline without the GPU.
-- `wl/<take>.npz`, `mp/<take>.npz`: `--log` files, made with the MediaPipe filter presets (before
-  the WiLoR tuning). `windows.json` (same in both): the scoring window per take, in s.
+- `lm_wl_<take>.npz`: WiLoR landmarks on those frames (`--record`), `extract_wl_*.txt` the console
+  output. `--replay lm_wl_<take>.npz` reruns the pipeline without the GPU (made with the rig of
+  commit 2513a49: pass it with `--rig`).
+- `wl/<take>.npz`: `--log` files, made with the MediaPipe filter presets (before the WiLoR
+  tuning). `windows.json`: the scoring window per take, in s.
+- On `mac-version` the MediaPipe side of the comparison (`lm_mp_*`, `mp/`, `extract_mp_*`) is
+  deleted; it's still on `ik-improvements`.
 - `tune_*.json`: grid searches (scratch script, not kept); `ref` = settings compared against,
   `all` = every setting with its `kalman_bench` scores. `tune_edge_smooth.json` holds the chosen ones.
 
@@ -45,4 +48,4 @@ p_stay 0.999 scored ~0.002 better but was not used, as too sticky.
 Full pipeline (`--replay lm_wl_<take>.npz`, `filter_eval.py --window`), old → new (wilor smooth):
 still jitter out 0.53 → 0.22 mm (MediaPipe on its own data: 0.22); sweep lag 30 → 10 ms,
 jitter 2.17 → 2.51; reach lag 42 → 16 ms, jitter 2.05 → 2.46, overshoot 3.6 → 3.5 mm.
-MediaPipe replays are bit-identical to before (`rec_reach.npz`).
+MediaPipe replays were bit-identical to before (`rec_reach.npz`, on `ik-improvements`).

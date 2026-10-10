@@ -1,10 +1,10 @@
 """WiLoR landmark backend: 21 hand landmarks (pixels) per camera view, from the MANO hand model.
 
-Same interface as ../MediaPipe/mediapipe_landmarks.py, so common/hand3d.StereoHand
-and everything after it are shared (see ../WILOR_PLAN.md):
+The landmark backend seam of common/ (stereo_cam.make_landmarks), so common/hand3d.StereoHand
+and everything after it are backend-independent (see ../WILOR_PLAN.md):
 
     StereoLandmarks(f0, f1, t) -> (px0, px1), each a (21, 2) array of full-frame
-    pixels (distorted image, OpenPose joint order = MediaPipe's) or None.
+    pixels (distorted image, OpenPose joint order, the same as MediaPipe's) or None.
 
 Per call, for each view:
   1. Hand box: YOLO (repo/pretrained_models/detector.pt, also gives left/right)
@@ -14,24 +14,26 @@ Per call, for each view:
      frame) is dropped for that frame and re-detected on the next: a blurry
      frame once collapsed it into a tiny hand at the wrist, and the box from
      those keypoints kept it there until the next YOLO pass. One hand, like
-     MediaPipe num_hands=1: the detection overlapping the tracked hand (kept
+     num_hands=1: the detection overlapping the tracked hand (kept
      down to conf 0.3, and keeping the track's left/right label), else the
      largest with conf >= 0.5 (both views prefer the same handedness).
   2. Square crop of `rescale` x the box, warped to 256x256 (zero padding at the
      image edge, never squashed). WiLoR only models right hands: left-hand
      crops are mirrored, as upstream does (vitdet_dataset.py).
-  3. Both views in one forward pass (fp16 on CUDA). Keypoints come back in
+  3. Both views in one forward pass (fp16 on the GPU: Apple MPS, or CUDA). Keypoints come back in
      crop units (-0.5..0.5 around the center) and map back exactly.
 
 Extras for later phases (MANO rotation, single-view 3D): self.last[view] =
 {"box", "is_right", "conf", "global_orient" (3x3, in the crop's camera, mirrored
 for left hands), "kp3d" (21x3 m, same frame), "cam_t"} or None.
 
-Speed (RTX 2060, fp16, bench_wilor.py): 47 ms for both views (~21 Hz) + ~9 ms
-for a YOLO pass. Needs the WiLoR venv (torch, ultralytics) and repo/
-(weights + mano_data, gitignored).
+Speed: on the old RTX 2060 (fp16, bench_wilor.py) 47 ms for both views (~21 Hz) + ~9 ms
+for a YOLO pass; on the Mac (MPS) not measured yet: run bench_wilor.py. Needs torch,
+ultralytics and repo/'s requirements in the conda env, and repo/ (weights + mano_data,
+gitignored). If an op isn't implemented on MPS: PYTORCH_ENABLE_MPS_FALLBACK=1 (that op runs
+on the CPU) or fp32=True.
 
-Self-test (no cameras, demo images): Computer-Vision/WiLoR/.venv/bin/python Computer-Vision/WiLoR/wilor_landmarks.py
+Self-test (no cameras, demo images): python Computer-Vision/WiLoR/wilor_landmarks.py
 """
 import math
 import os
@@ -47,6 +49,14 @@ MEAN = np.array([0.485, 0.456, 0.406]) * 255.0
 STD = np.array([0.229, 0.224, 0.225]) * 255.0
 
 
+def best_device():
+    """'mps' (Apple GPU), else 'cuda', else 'cpu'."""
+    import torch
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cuda" if torch.cuda.is_available() else "cpu"
+
+
 def load_models(device=None, fp32=False):
     """(wilor model, YOLO detector, torch device, dtype). Loads from repo/; load_wilor
     hardcodes ./mano_data/, so the cwd is changed only while loading."""
@@ -57,9 +67,12 @@ def load_models(device=None, fp32=False):
         sys.path.insert(0, REPO)
     from wilor.models import load_wilor
 
-    dev = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+    dev = torch.device(device or best_device())
     dtype = torch.float32 if (fp32 or dev.type == "cpu") else torch.float16
-    torch.backends.cudnn.benchmark = True
+    if dev.type == "cpu":
+        print("WARNING: WiLoR on the CPU (no MPS/CUDA): very slow", flush=True)
+    if dev.type == "cuda":
+        torch.backends.cudnn.benchmark = True
     torch.serialization.add_safe_globals([ultralytics.nn.tasks.PoseModel])
     cwd = os.getcwd()
     os.chdir(REPO)
@@ -137,7 +150,7 @@ class StereoLandmarks:
         torch = self.torch
         blank = np.zeros((size[1], size[0], 3), np.uint8)
         for k in (1, 2):  # YOLO on one or both views
-            self.detector([blank] * k, verbose=False, conf=self.conf, imgsz=self.yolo_size)
+            self.detector([blank] * k, verbose=False, conf=self.conf, imgsz=self.yolo_size, device=self.dev)
         with torch.inference_mode():
             for k in (1, 2):  # WiLoR on the hand in one or both views
                 x = torch.zeros((k, 3, CROP, CROP), device=self.dev, dtype=self.dtype)
@@ -147,7 +160,8 @@ class StereoLandmarks:
     # -- detection ---------------------------------------------------------
     def _detect(self, frames):
         """Per frame: list of (box, is_right, conf), YOLO in one batch."""
-        res = self.detector(list(frames), verbose=False, conf=self.conf, imgsz=self.yolo_size)
+        # device explicitly: ultralytics picks CUDA or the CPU by itself, never MPS
+        res = self.detector(list(frames), verbose=False, conf=self.conf, imgsz=self.yolo_size, device=self.dev)
         out = []
         for r in res:
             b = r.boxes

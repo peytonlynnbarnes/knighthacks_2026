@@ -1,11 +1,12 @@
-#!/home/peyton/kh/.venv/bin/python
+#!/usr/bin/env python3
 """Stereo hand tracking -> /ball_position [x y z roll pitch yaw] for the SO-101 IK,
 plus /gripper (0 open .. 1 closed) from how far the fingers are curled.
 
 Pipeline (see ~/kh/INTEGRATION.md for the /ball_position contract):
-    2 cameras (resolution and focus from calib/stereo.npz, auto exposure and
-    white balance) -> pair nearest frames -> 21 landmarks per view (--backend:
-    MediaPipe, or WiLoR's MANO hand model, see ../WILOR_PLAN.md) -> cam1 landmarks moved to cam0's time
+    2 cameras (macOS AVFoundation, --cams LEFT RIGHT; resolution from
+    calib/stereo.npz, auto exposure and white balance, manual focus rings) ->
+    pair nearest frames -> 21 landmarks per view (WiLoR's MANO hand model on the
+    Apple GPU, see ../WILOR_PLAN.md) -> cam1 landmarks moved to cam0's time
     -> triangulate -> drop single bad landmarks, validate (reprojection,
     palm bone lengths, template fit; one bad palm point is tolerated) -> hand frame
     -> relative to the calibrated neutral hand -> robot axes, x scale
@@ -18,13 +19,12 @@ window; ~10 s with --no-range-calib, which skips the roll/tilt range steps), eve
 control is consistent from session to session. Needs calib/stereo.npz from
 stereo_calib.py.
 
-Run (venv python + ROS on PYTHONPATH, like feetech_mirror.py):
-    source /opt/ros/jazzy/setup.bash
-    .venv/bin/python Computer-Vision/common/hand_target_node.py --no-ros   # print only
-    .venv/bin/python Computer-Vision/common/hand_target_node.py            # publish
-    Computer-Vision/WiLoR/.venv/bin/python Computer-Vision/common/hand_target_node.py --backend wilor
-    # IK without the Gazebo ball:
-    ros2 launch so101_mirror sim.launch.py ball_source:=false   (or ros2 run so101_mirror ik_node.py)
+Run (the conda env with ROS 2 Jazzy + torch, see README.md):
+    conda activate ros2_jazzy
+    python Computer-Vision/common/hand_target_node.py --cams 1 2 --no-ros   # print only
+    python Computer-Vision/common/hand_target_node.py --cams 1 2            # publish
+    # IK (no Gazebo needed):
+    ros2 run so101_mirror ik_node.py
 
 Controls:
     calibration hand = origin: arm at home (the mid-workspace pose, see
@@ -58,15 +58,16 @@ Filter testing (Phase 0, see filter_eval.py):
     --record rec.npz   save the raw landmarks + capture times of every frame
                        (start recording from launch: replay redoes the hand
                        calibration from the recorded frames)
-    --replay rec.npz   no cameras / MediaPipe: run the recording through the
+    --replay rec.npz   no cameras / no GPU: run the recording through the
                        same estimator + mapper (pass the same --frame /
                        --no-range-calib). With --no-ros it runs as fast as it
                        can; publishing, it plays back in real time. The
-                       file records its --backend; replay uses that one.
+                       file records its --backend (only WiLoR recordings
+                       replay on this branch).
     --record-frames D  save both camera streams instead (JPEG, common/frames.py)
-    --replay-frames D  run them through --backend: compares MediaPipe and
-                       WiLoR on identical video; --replay-live drops the
-                       pairs a live run would have missed (fair for WiLoR)
+    --replay-frames D  run them through the backend (identical video, e.g.
+                       to compare settings); --replay-live drops the pairs a
+                       live run would have missed
     --log out.npz     per frame: hand pose, unfiltered target, published
                        target, grip (live or replayed) -> filter_eval.py
 
@@ -89,8 +90,8 @@ from frames import FrameRecorder, FrameReplay, ReplayEnd
 from hand_calib import HandCalibrator, hand_path, save_hand
 from hand_mapping import (BOX_MIN, IMM_PRESETS, KALMAN_DEFAULTS, GripFilter, HandMapper, RotationShaper, StereoIMM,
                           StereoKalman, StillHold, gains_from_range)
-from stereo_cam import (BACKENDS, RIG_PATH, StereoCam, draw_hand, fit_view, load_rig, make_landmarks,
-                        rig_focus)
+from stereo_cam import (BACKENDS, DEFAULT_CAMS, RIG_PATH, StereoCam, draw_hand, fit_view, load_rig,
+                        make_landmarks)
 
 BALL_TOPIC = "/ball_position"  # must match so101_mirror.BALL_TOPIC
 GRIP_TOPIC = "/gripper"        # std_msgs/Float64, 0 = open .. 1 = closed (feetech_mirror --gripper)
@@ -261,12 +262,13 @@ def draw_axes(img, pose, K, d, scale=0.05):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cams", type=int, nargs=2, default=[0, 2])
+    ap.add_argument("--cams", type=int, nargs=2, default=DEFAULT_CAMS, metavar=("LEFT", "RIGHT"),
+                    help="AVFoundation indices: cam0 = left camera, cam1 = right, as calibrated "
+                         "(find them with stereo_cam.py --list)")
     ap.add_argument("--rig", default=RIG_PATH)
     ap.add_argument("--no-ros", action="store_true", help="don't publish, just print")
-    ap.add_argument("--backend", choices=BACKENDS, default="mediapipe",
-                    help="landmarks: mediapipe (CPU, ~/kh/.venv) or wilor (MANO model, CUDA, run with "
-                         "Computer-Vision/WiLoR/.venv/bin/python); see Computer-Vision/WILOR_PLAN.md")
+    ap.add_argument("--backend", choices=BACKENDS, default="wilor",
+                    help="landmarks: wilor (MANO model, Apple GPU); see Computer-Vision/WILOR_PLAN.md")
     ap.add_argument("--wilor-hand", choices=["any", "right", "left"], default="any",
                     help="wilor: track only this hand (default: whichever it finds, then keep it)")
     ap.add_argument("--wilor-yolo-every", type=int, default=4,
@@ -304,12 +306,6 @@ def main():
                          "than the hand)")
     ap.add_argument("--reproj-px", type=float, default=15.0,
                     help="drop landmarks whose reprojection error is above this (px)")
-    ap.add_argument("--exposure", default="auto",
-                    help="'auto' (default), 'match' (fixed exposure for a set brightness, both "
-                         "cameras alike; needs a bright room) or a value in 100 us units")
-    ap.add_argument("--focus", type=int, default=None,
-                    help="locked focus 0..1023 (default: the one the rig was calibrated at, "
-                         "else autofocus)")
     ap.add_argument("--no-skew-correct", action="store_true",
                     help="don't move cam1's landmarks to cam0's capture time")
     ap.add_argument("--frame", choices=["fit", "3pt"], default="fit",
@@ -337,7 +333,7 @@ def main():
     ap.add_argument("--pos-filter", choices=["imm", "kalman", "euro"], default="imm",
                     help="position filter: still/moving model pair (hand_mapping.StereoIMM), a single "
                          "stereo-aware Kalman (StereoKalman, --kf-*) or the old one-euro (--euro-pos)")
-    ap.add_argument("--imm", choices=sorted(IMM_PRESETS["mediapipe"]), default="smooth",
+    ap.add_argument("--imm", choices=sorted(IMM_PRESETS["wilor"]), default="smooth",
                     help="IMM setting: smooth (default) or responsive (less tracking error, overshoot "
                          "and lag, rougher); tuned separately per --backend (hand_mapping.IMM_PRESETS)")
     ap.add_argument("--kf-q", type=float, default=None,
@@ -384,7 +380,6 @@ def main():
     est = h3.StereoHand(rig, reproj_px=args.reproj_px, mono_fallback=args.mono_fallback,
                         frame=args.frame, fit_mm=args.fit_mm, jump_deg=args.jump_deg)
     size = tuple(int(v) for v in rig["size"])
-    focus = args.focus if args.focus is not None else rig_focus(rig)
     print(f"stereo rig: {args.rig} ({rig['method']}), {size[0]}x{size[1]}, baseline "
           f"{np.linalg.norm(rig['t']) * 100:.1f} cm")
     calib, mapper, grip_f = None, None, None
@@ -443,6 +438,9 @@ def main():
     pub = Publisher(not args.no_ros)
     replay = Replay(args.replay, realtime=not args.no_ros) if args.replay else None
     if replay is not None:  # the landmarks are in the file; it says which backend made them
+        if replay.backend not in BACKENDS:
+            raise SystemExit(f"{args.replay} was recorded with {replay.backend}, which this branch "
+                             f"doesn't have (filter presets: {', '.join(BACKENDS)})")
         args.backend = replay.backend
     rec = Recorder(args.record, args.backend) if args.record else None
     frec = FrameRecorder(args.record_frames) if args.record_frames else None
@@ -452,10 +450,9 @@ def main():
         print(f"replaying {args.replay} ({len(cam.t)} frames, {cam.backend}); recorded with: "
               f"{cam.argv or '(defaults)'}")
     else:
-        # backend first: WiLoR takes ~15 s to load, and a wrong venv fails before the cameras open
-        kw = ({} if args.backend == "mediapipe" else
-              dict(hand=args.wilor_hand, yolo_every=args.wilor_yolo_every, fp32=args.wilor_fp32))
-        lms = make_landmarks(args.backend, **kw)
+        # backend first: WiLoR takes ~15 s to load, and missing packages fail before the cameras open
+        lms = make_landmarks(args.backend, hand=args.wilor_hand, yolo_every=args.wilor_yolo_every,
+                             fp32=args.wilor_fp32)
         print(f"landmarks: {args.backend}")
         if args.replay_frames:
             cam = FrameReplay(args.replay_frames, realtime=not args.no_ros and not args.replay_live,
@@ -464,12 +461,7 @@ def main():
                   f"recorded with: {cam.argv or '(defaults)'}")
         else:
             cam = StereoCam(args.cams, size=size)  # the intrinsics only hold at the calibrated size
-            exposure = {"match": "match", "auto": None}.get(args.exposure, args.exposure)
-            print("cameras:", cam.configure(float(exposure) if exposure not in ("match", None) else exposure,
-                                            focus=focus))
-            if focus is None:
-                print("  autofocus: the focal length may drift from the calibration; calibrate with "
-                      "stereo_calib.py --focus N to lock it")
+            print("cameras:", cam.configure())
     skew = None if args.no_skew_correct else h3.SkewCorrector()
     lost_since, grip = None, None  # when the hand disappeared; filtered grip 0..1
     last_print, fps_n, fps_t, fps = 0.0, 0, time.monotonic(), 0.0
