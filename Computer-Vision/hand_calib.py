@@ -73,7 +73,8 @@ class HandCalibrator:
             self.msg = f"palm width {width * 100:.1f} cm" + (
                 "  (unusual: check --hfov / stereo calib)" if not 0.055 < width < 0.11 else "")
             self.neutral_p = np.median([q["p"] for q in poses], axis=0)
-            self.neutral_R = h3.project_to_so3(np.mean([q["R"] for q in poses], axis=0))
+            # same median hand as the template, so the 5-point fit at neutral is exactly this
+            self.neutral_R = h3.hand_frame(P)[1]
             self.bones = np.median([h3.bone_lengths(q["P"]) for q in poses], axis=0)
             self.template = h3.palm_template(P)
             self.step, self.buf = "FORWARD", deque()

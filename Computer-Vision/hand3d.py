@@ -14,6 +14,11 @@ Hand frame (from MediaPipe's 21 landmarks, triangulated to 3D):
     z = palm normal (5 - 0) x (17 - 0); the sign flips with chirality,
         which is fine: only rotations relative to the calibrated neutral are used
     y = z x x
+    That 3-point construction defines the frame (and the palm template saved
+    at calibration). While tracking, the rotation is instead a least-squares
+    fit of that template to all 5 palm points, so noise on any one landmark
+    is averaged over all five instead of setting an axis directly. (It still
+    doesn't reject a single badly wrong landmark.)
 
 Self-test (synthetic stereo, no hardware):
     .venv/bin/python Computer-Vision/hand3d.py
@@ -107,8 +112,17 @@ def palm_center(P):
     return P[PALM].mean(axis=0)
 
 
-def hand_frame(P):
-    """(origin (3,), R (3,3) columns = hand x/y/z axes in the points' frame)."""
+def hand_frame(P, template=None):
+    """(origin (3,), R (3,3) columns = hand x/y/z axes in the points' frame).
+
+    template: (5,3) palm points in the hand frame (palm_template()). If given,
+    R is the least-squares rotation (Kabsch) taking the template onto all 5
+    palm points; otherwise x = wrist -> middle MCP and z = palm normal from
+    wrist, index MCP and pinky MCP (see the module docstring).
+    """
+    if template is not None:
+        Q = P[PALM] - palm_center(P)  # centered, so the template's offset cancels
+        return palm_center(P), project_to_so3(Q.T @ template)
     x = P[MIDDLE_MCP] - P[WRIST]
     z = np.cross(P[INDEX_MCP] - P[WRIST], P[PINKY_MCP] - P[WRIST])
     x = x / np.linalg.norm(x)
@@ -198,7 +212,7 @@ class StereoHand:
 
     estimate() returns (pose, reason). pose is a dict:
         P     (21,3) points (NaN where unknown, i.e. non-palm points in mono mode)
-        p, R  hand_frame() origin and rotation
+        p, R  hand_frame() origin and rotation (5-point fit once set_hand() is called)
         fist  bool (stereo only; False in mono mode)
         mode  "stereo" | "mono0" | "mono1"
         err   median reprojection error (px), stereo only
@@ -229,7 +243,7 @@ class StereoHand:
             elif self.bones is not None and not bones_ok(P, self.bones, self.bone_tol):
                 reason = "bones"
             else:
-                p, R = hand_frame(P)
+                p, R = hand_frame(P, self.template)
                 return dict(P=P, p=p, R=R, fist=is_fist(P), curl=curl(P), mode="stereo", err=err), ""
             # stereo failed validation: fall through to mono if allowed
         else:
@@ -246,7 +260,7 @@ class StereoHand:
                 continue
             P = np.full((21, 3), np.nan)
             P[PALM] = X
-            p, R = hand_frame(P)
+            p, R = hand_frame(P, self.template)
             return dict(P=P, p=p, R=R, fist=False, curl=None, mode=f"mono{k}", err=float("nan")), ""
         return None, reason
 
@@ -338,8 +352,21 @@ def _selftest():
     _, R_b = hand_frame((X - palm_center(X)) @ dR.T + palm_center(X))
     assert np.allclose(R_b @ R_a.T, dR, atol=1e-9)
 
-    # PnP fallback from cam1 only
+    # 5-point palm fit: exact on a clean hand, and less error than 3 points on noisy ones
     tmpl = palm_template(X)
+    assert np.allclose(hand_frame(X, tmpl)[1], R_a, atol=1e-9)
+    e3, e5 = [], []
+    for _ in range(500):
+        dR = rotvec_to_matrix(rng.normal(0, 0.5, 3))
+        Xn = X @ dR.T
+        Xn[PALM] += rng.normal(0, 0.004, (5, 3))  # 4 mm landmark noise
+        for e, R in ((e3, hand_frame(Xn)[1]), (e5, hand_frame(Xn, tmpl)[1])):
+            e.append(math.degrees(np.linalg.norm(matrix_to_rotvec(R @ (dR @ R_a).T))))
+    print(f"palm rotation, 4 mm noise: 3-point median err {np.median(e3):.1f} deg, "
+          f"5-point fit {np.median(e5):.1f} deg")
+    assert np.median(e5) < np.median(e3)
+
+    # PnP fallback from cam1 only
     px1 = view(X, R_true, t_true)
     X0, _ = palm_pnp(px1, K, dist, tmpl, R_true, t_true)
     e = np.linalg.norm(X0 - X[PALM], axis=1)
