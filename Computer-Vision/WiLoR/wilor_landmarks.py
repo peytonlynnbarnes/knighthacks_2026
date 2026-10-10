@@ -83,6 +83,12 @@ def load_models(device=None, fp32=False):
     finally:
         os.chdir(cwd)
     assert cfg.MODEL.IMAGE_SIZE == CROP, cfg.MODEL.IMAGE_SIZE
+    if dev.type == "mps":
+        # torch 2.5 MPS conv2d fails on non-contiguous inputs ("view size is not compatible");
+        # WiLoR's refine_net gets the permuted ViT feature map, so make every conv input contiguous
+        for m in model.modules():
+            if isinstance(m, (torch.nn.Conv2d, torch.nn.ConvTranspose2d)):
+                m.register_forward_pre_hook(lambda _m, args: tuple(a.contiguous() for a in args))
     detector.to(dev)
     return model.to(device=dev, dtype=dtype).eval(), detector, dev, dtype
 
