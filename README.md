@@ -1,110 +1,292 @@
-# kh: hand-tracked SO-ARM101 (macOS, `mac-version` branch)
+# kh: hand-tracked SO-ARM101 robot arm (macOS)
 
-Computer vision tracks a hand, and the SO-ARM101 robot arm follows it.
+Two webcams watch your hand. The WiLoR hand model (on the Mac's GPU) finds it in both views, the
+pipeline triangulates it to 3D, and the SO-ARM101 arm follows: hand position → gripper position,
+hand tilt/roll → gripper tilt/roll, closing your fingers → closing the gripper.
 
-- `control/`: talks to the arm's Feetech STS3215 servos.
-- `ros_ws/src/so101_mirror/`: ROS 2 Jazzy package: target → IK → `/arm/<joint>` commands (+ an optional Gazebo ball sim).
-- `Computer-Vision/`: stereo hand tracking with the WiLoR (MANO) hand model → `/ball_position` + `/gripper`.
-- `INTEGRATION.md`: topic contract, how the pieces connect, calibration status. `MAC_INTEGRATION.md`: what changed for the Mac and the bring-up order.
+```
+2 webcams ──► hand_target_node.py ──/ball_position──► ik_node.py ──/arm/<joint>──► feetech_mirror.py ──► arm
+              (WiLoR, Apple GPU)    ──/gripper──────────────────────────────────►  (servo driver)
+```
 
-This branch runs on macOS only (Apple silicon: AVFoundation cameras, the Apple GPU via PyTorch MPS,
-`/dev/cu.*` serial ports). The Linux/WSL setup is on `ik-improvements`.
+This is the **`mac-version`** branch: macOS on Apple silicon only (AVFoundation cameras, PyTorch
+MPS, `/dev/cu.*` serial ports), WiLoR as the only hand model. The Linux/WSL version is on
+`ik-improvements`.
 
-## Requirements
+| Folder / file | What |
+|---|---|
+| `Computer-Vision/common/` | cameras, stereo + hand calibration, triangulation, filters, `hand_target_node.py` |
+| `Computer-Vision/WiLoR/` | the WiLoR hand-model backend (`wilor_landmarks.py`) + `repo/` (weights, not in git) |
+| `ros_ws/src/so101_mirror/` | ROS 2 package: `ik_node.py` (target → joint angles), optional Gazebo ball sim |
+| `control/` | servo scripts: `feetech_mirror.py` (ROS → servos), `servo_raw.py`, `jog.py`, … |
+| `INTEGRATION.md`, `MAC_INTEGRATION.md` | topic contract and design notes; what changed for the Mac |
+| `control/CLAUDE.md` | **safety rules for the real arm: read before moving it** |
+
+---
+
+## What you need
 
 - A Mac with Apple silicon (written for a MacBook Pro M5 Pro).
-- ROS 2 Jazzy in a conda environment (RoboStack, `robostack-jazzy` + `conda-forge` channels).
-- The arm's USB servo board and two USB webcams (Adesso CyberTrack H4), each on its own USB port.
-- `Computer-Vision/WiLoR/repo/` (the WiLoR code, `pretrained_models/`, `mano_data/`): not in git,
-  copy it from the old machine. MANO is under a non-commercial license: never commit or upload it.
+- ROS 2 Jazzy in a conda env named `ros2_jazzy` (RoboStack, `robostack-jazzy` + `conda-forge`).
+- 2× Adesso CyberTrack H4 webcams, ~21 cm apart, angled in slightly, at hand height. Plug each
+  into **its own USB port** (not a shared hub).
+- The SO-ARM101 with its USB servo board and power supply.
+- A phone or tablet to show the calibration chessboard, and a ruler.
+- `Computer-Vision/WiLoR/repo/` from the old machine (~2.5 GB: WiLoR code, `pretrained_models/`,
+  `mano_data/`). It isn't in git. **MANO has a non-commercial license: never commit or upload it.**
 
-## 1. ROS 2 Jazzy (conda)
+---
 
-Every terminal: `conda activate ros2_jazzy` (or `micromamba activate`). Check it has what's needed:
+## One-time setup
 
-```bash
-python -c "import rclpy, std_msgs.msg, numpy; print('ok', numpy.__version__)"
-ros2 pkg list | grep -E "^(std_msgs|geometry_msgs|xacro)$"
-# missing ones / build tools:
-conda install -c robostack-jazzy -c conda-forge ros-jazzy-xacro ros-jazzy-geometry-msgs \
-    compilers cmake pkg-config make ninja colcon-common-extensions
-```
-
-If nodes on the same Mac don't see each other's topics: `export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
-in every terminal. Allow the macOS firewall prompt.
-
-## 2. Build the ROS workspace
+### 1. Get the code and the WiLoR weights
 
 ```bash
-cd ~/kh/ros_ws
-colcon build --symlink-install
-source install/setup.zsh     # every new terminal, after activating the env (zsh is the macOS default)
+cd ~
+git clone git@github.com:peytonlynnbarnes/knighthacks_2026.git kh
+cd kh
+git checkout mac-version
 ```
 
-`--symlink-install` makes edits to Python scripts take effect without rebuilding. Rebuild after you add
-new files. Gazebo (`ros-jazzy-ros-gz`) is only needed for the ball sim (`sim.launch.py`), not for the arm.
+Copy `repo/` from the old machine into `~/kh/Computer-Vision/WiLoR/repo/`, over the network or with a
+USB drive. Example from the old machine (WSL), with `<mac>` = the Mac's hostname or IP:
+```bash
+rsync -a --progress ~/kh/Computer-Vision/WiLoR/repo/ VJ@<mac>:~/kh/Computer-Vision/WiLoR/repo/
+```
+Check on the Mac: `ls ~/kh/Computer-Vision/WiLoR/repo/pretrained_models` should list
+`wilor_final.ckpt`, `model_config.yaml` and `detector.pt`, and `repo/mano_data/` should exist.
 
-## 3. Python packages (same conda env)
+### 2. Check the ROS environment
+
+Every terminal you use for this project starts with `conda activate ros2_jazzy`.
+
+```bash
+conda activate ros2_jazzy
+python --version                                   # 3.12.x
+python -c "import rclpy, std_msgs.msg; print('rclpy ok')"
+ros2 pkg list | grep -E "^(std_msgs|geometry_msgs|xacro)$"   # all three must be listed
+pip show numpy | head -2                           # note the version (step 3 keeps it)
+```
+Missing build tools: `conda install -c conda-forge compilers cmake pkg-config make ninja colcon-common-extensions`.
+
+### 3. Install the Python packages (into the same env)
+
+ROS's message packages are built against conda's numpy, so pip must not replace it. The first
+line pins it to whatever version conda installed:
 
 ```bash
 cd ~/kh
 python -c "import numpy; print(f'numpy=={numpy.__version__}')" > /tmp/numpy-pin.txt
 pip install -r requirements.txt -c /tmp/numpy-pin.txt
-pip install --no-build-isolation git+https://github.com/mattloper/chumpy
-python -c "import torch; print('MPS', torch.backends.mps.is_available())"   # must say True
+pip install --no-build-isolation git+https://github.com/mattloper/chumpy   # needed to load MANO
+python -c "import torch; print('MPS available:', torch.backends.mps.is_available())"   # must be True
 ```
 
-The numpy pin keeps conda's numpy: ROS's messages are built against it, and pip must not replace it.
+If numpy is **2.x** and the WiLoR self-test in step 6 fails to import (chumpy or ultralytics),
+make a conda env with numpy 1.26 instead: see `MAC_INTEGRATION.md` ("Risks").
 
-## 4. Devices
-
-- **Servo board:** shows up as `/dev/cu.usbmodem…` (or `/dev/cu.usbserial…`). The control scripts find
-  it automatically when it's the only one; otherwise pass `--port /dev/cu.usbmodemXXXX` (`ls /dev/cu.*`).
-- **Cameras:** the terminal app needs camera access (System Settings → Privacy & Security → Camera).
-  Turn off iPhone Continuity Camera while working. Find the camera numbers:
-  ```bash
-  python Computer-Vision/common/stereo_cam.py --list
-  ```
-  Then pass `--cams LEFT RIGHT` to `stereo_cam.py`, `stereo_calib.py` and `hand_target_node.py`
-  (default `1 2`; cam0 = the left camera). Two identical H4s can swap numbers between plug-ins: check.
-- **Focus:** the H4s have manual focus rings. Set them in the preview
-  (`stereo_cam.py --cams L R --no-landmarks` shows each view's sharpness: same textured target in
-  both, turn until the number peaks), then tape them. Recalibrate after turning one.
-
-## 5. Check that it works
+### 4. Build the ROS workspace
 
 ```bash
-# servos: scan IDs 1–6 and print position/load/voltage/temp (no motion)
-python control/servo_raw.py
-
-# WiLoR on the Apple GPU (demo images, no cameras), then its speed
-python Computer-Vision/WiLoR/wilor_landmarks.py
-python Computer-Vision/WiLoR/bench_wilor.py
-
-# cameras + hand landmarks
-python Computer-Vision/common/stereo_cam.py --cams L R
-
-# stereo calibration (once per camera mount / focus ring change; see the script's docstring)
-python Computer-Vision/common/stereo_calib.py --board --square-mm 20 --cams L R
-
-# IK → servo ticks, dry run (doesn't move the arm)
-ros2 run so101_mirror ik_node.py
-python control/feetech_mirror.py --no-bus
+cd ~/kh/ros_ws
+colcon build --symlink-install
+source install/setup.zsh          # zsh is the macOS default shell; setup.bash for bash
 ```
+`--symlink-install` makes Python edits take effect without rebuilding (rebuild after adding files).
 
-For the full pipeline, the `--live` mode and calibration, see `INTEGRATION.md` and
-`MAC_INTEGRATION.md`. Before you run anything that moves the arm, read the safety rules in
-`control/CLAUDE.md`.
+### 5. Allow camera access
+
+The first time a script opens a camera, macOS asks whether your terminal app (Terminal, iTerm,
+VS Code…) may use the camera: allow it, then run the script again. If you missed it: System
+Settings → Privacy & Security → Camera → enable your terminal app.
+
+Also turn off iPhone Continuity Camera while working (System Settings → General → AirDrop &
+Handoff), so the phone doesn't show up as a camera.
+
+### 6. Check that each part works (no arm motion)
+
+```bash
+cd ~/kh
+python Computer-Vision/WiLoR/wilor_landmarks.py      # WiLoR self-test on demo images: "self-test OK"
+python Computer-Vision/WiLoR/bench_wilor.py          # speed on the Apple GPU ("device mps")
+python control/servo_raw.py                          # arm plugged in + powered: lists servos 1–6
+```
+`servo_raw.py` finds the servo board's port itself (`/dev/cu.usbmodem…`). If it says there are
+none or several, run `ls /dev/cu.*` and pass `--port /dev/cu.usbmodemXXXX`.
+
+---
+
+## Camera setup (once, and again whenever a camera or a focus ring moves)
+
+### 7. Find the camera numbers
+
+```bash
+python Computer-Vision/common/stereo_cam.py --list
+```
+A window shows every camera with its number. The MacBook's own camera is usually `0`. Cover one
+H4 lens to see which number is which. **LEFT** = the camera on the left when you stand behind the
+cameras looking the same way they do; **RIGHT** = the other one. Every command below takes
+`--cams LEFT RIGHT` (default `1 2`). The two H4s can swap numbers when you replug them: check
+again after replugging.
+
+### 8. Focus the cameras
+
+The H4s have manual focus rings (software focus does nothing).
+```bash
+python Computer-Vision/common/stereo_cam.py --cams LEFT RIGHT --no-landmarks
+```
+Hold a textured target (the chessboard, printed text) at your hand's working distance in the
+middle of both views. The top line shows each view's **sharpness**: turn a ring slowly until its
+number peaks, for both cameras. Tape the rings afterwards.
+
+### 9. Calibrate the stereo rig
+
+```bash
+python Computer-Vision/common/stereo_calib.py --board           # writes calib/chessboard.png, exits
+```
+Show `Computer-Vision/common/calib/chessboard.png` full screen on the phone at max brightness,
+measure 10 squares in a row with a ruler (mm) and divide by 10. Then:
+```bash
+python Computer-Vision/common/stereo_calib.py --board --square-mm <size> --cams LEFT RIGHT
+```
+Follow the window: hold the phone still for each grab. It takes 15 close-up views per camera
+(6 of them tilted 20–40°) and 12 views both cameras see. Good results (from the Linux machine):
+rms ~0.2 px per camera, stereo ~0.4 px, baseline ~21 cm. It refuses to save a bad calibration.
+The result is `Computer-Vision/common/calib/stereo.npz`.
+
+### 10. Check the cameras with hand tracking
+
+```bash
+python Computer-Vision/common/stereo_cam.py --cams LEFT RIGHT
+```
+You should see the hand skeleton in both views, `pairs/s` around 15–30 and a small skew.
+`q` quits.
+
+---
+
+## Running it
+
+Open **three terminals**. Start each one with:
+```bash
+conda activate ros2_jazzy
+cd ~/kh
+source ros_ws/install/setup.zsh
+```
+If the terminals don't see each other's topics, also run `export ROS_AUTOMATIC_DISCOVERY_RANGE=LOCALHOST`
+in each (and allow the macOS firewall prompt).
+
+### Step A: hand tracking only (prints, publishes nothing)
+
+```bash
+python Computer-Vision/common/hand_target_node.py --cams LEFT RIGHT --no-ros
+```
+WiLoR loads (~15 s), then the **hand calibration** starts. Follow the text in the window, with
+your hand in view of both cameras:
+
+1. open hand, palm to the cameras, hold still 2 s
+2. move the hand ~15 cm in the **arm's forward** direction, hold
+3. bring it back to the start
+4. flat hand, roll it clockwise a quarter turn (like a doorknob), then back
+5. tilt the hand as far as it still tracks (fingertips toward or away from the cameras), then back
+6. tilt the other way, then back
+7. hand back at the start, palm to the cameras
+
+Where your hand was in step 1 is the arm's home. After that, the terminal prints the target it
+would send (`xyz cm`, `rpy deg`, `grip`). `c` recalibrates, `q` quits.
+
+### Step B: the full pipeline, arm in dry run (no motion)
+
+```bash
+# terminal 1: IK
+ros2 run so101_mirror ik_node.py
+
+# terminal 2: servo driver, DRY RUN: reads the arm, prints the planned ticks, no torque
+python control/feetech_mirror.py --gripper
+
+# terminal 3: hand tracking, publishing
+python Computer-Vision/common/hand_target_node.py --cams LEFT RIGHT \
+    --z-min -0.08 --pitch-gain 1.4 2.4 --grip-closed-curl 0.75
+```
+Move your hand and watch terminal 2's table: the planned ticks should follow your hand
+(forward → arm reaches forward, up → arm goes up, fist → gripper closes).
+
+### Step C: live (the arm moves). Only with someone at the arm.
+
+Read `control/CLAUDE.md` first. Before going live:
+- lift the arm by hand out of its folded rest (shoulder_lift / elbow_flex must be inside their
+  limits) and keep wrist_roll on its usable side; `--live` refuses to start otherwise and says which joint.
+- clear the table around the arm.
+
+Stop terminal 2 (Ctrl-C) and restart it live, slowly first:
+```bash
+python control/feetech_mirror.py --gripper --live --max-speed 400
+```
+It asks for confirmation, turns torque on, homes all joints to the base pose at 400 ticks/s, then
+moves on its own to the working home (~11 cm, slowly) and starts following your hand.
+
+While running:
+- **Hide your hand** (≥ 0.3 s) = clutch: the arm and gripper hold. When the hand comes back the
+  arm continues from where it is (no jump), so you can reposition your hand.
+- **Gripper:** flat hand = open, fist = closed. It holds its value while your palm is turned more
+  than 55° away from the cameras; open/close with the hand facing the cameras more.
+- **Stop:** Ctrl-C in terminal 2. The arm holds its pose (torque stays on). `python control/torque_off.py`
+  makes it go limp: **support the arm first, it drops**.
+
+### Useful options (`hand_target_node.py`)
+
+| Option | What |
+|---|---|
+| `--z-min -0.08` | lowest the arm goes below home (m). −0.05 was too high to reach the table; go lower in small steps after checking clearance |
+| `--pitch-gain UP DOWN` | how much the gripper tilts per degree of hand tilt. `1.4 2.4` points the gripper down with ~35° of hand tilt (bigger hand tilts lose tracking) |
+| `--grip-closed-curl 0.75` | finger curl that counts as a closed fist (WiLoR reads a flat hand ~1.0) |
+| `--imm responsive` | less lag, slightly shakier still hand (default `smooth`) |
+| `--scale 1.3` | arm moves 1.3 cm per cm of hand motion (default 1.0) |
+| `--no-orientation` | position only, gripper stays level |
+| `--record-frames DIR` | save both camera streams (for replaying a problem later: `--replay-frames DIR`) |
+
+`python Computer-Vision/common/hand_target_node.py --help` lists everything.
+
+---
+
+## Testing without hardware
+
+```bash
+# replay a recorded WiLoR session (no cameras, no GPU); it was made with the old rig
+git show 2513a49:Computer-Vision/calib/stereo.npz > /tmp/old_stereo.npz
+python Computer-Vision/common/hand_target_node.py --no-ros --no-view --rig /tmp/old_stereo.npz \
+    --replay Computer-Vision/common/recordings/wilor/lm_wl_reach.npz --log /tmp/out.npz
+python Computer-Vision/common/filter_eval.py /tmp/out.npz --window 111 148
+# expected (Linux, 2026-10-10): jitter out 2.46 mm, lag 16 ms, overshoot 3.5 mm
+
+# self-tests
+python Computer-Vision/common/hand_mapping.py
+python Computer-Vision/common/hand3d.py
+python Computer-Vision/common/frames.py
+
+# IK + servo driver without the arm (prints the ticks the IK output maps to)
+ros2 run so101_mirror ik_node.py          # terminal 1
+python control/feetech_mirror.py --no-bus # terminal 2
+```
+Without the replay's `--no-ros`, the replay publishes in real time and drives terminals 1–2.
+
+The Gazebo ball sim (`ros2 launch so101_mirror sim.launch.py`) needs `ros-jazzy-ros-gz`, which is
+optional and may not be available for macOS.
+
+---
 
 ## Troubleshooting
 
-- **`ros2: command not found`**: the conda env isn't active in this terminal.
-- **`Package 'so101_mirror' not found`**: you didn't source `ros_ws/install/setup.zsh`, or the build failed.
-- **numpy / `_ARRAY_API` errors when importing `rclpy`**: pip replaced conda's numpy. Reinstall it
-  with conda (`conda install numpy=<the version ROS came with>`) and redo step 3 with the pin.
-- **`camera N: no frames`**: wrong index (`--list`), camera access not granted, or the camera is in
-  use by another app.
-- **`SLOW CAMERA`**: both cameras on one hub, or a dark room (auto exposure gets longer).
-- **WiLoR very slow / `WARNING: WiLoR on the CPU`**: torch has no MPS (`torch.backends.mps.is_available()`).
-  An op missing on MPS: run with `PYTORCH_ENABLE_MPS_FALLBACK=1`, or `--wilor-fp32`.
-- **IK jumps between solutions**: two IK nodes / sims are running. Use `export ROS_DOMAIN_ID=77` to isolate one.
+| Problem | Fix |
+|---|---|
+| `ros2: command not found` / `No module named rclpy` | `conda activate ros2_jazzy` in this terminal |
+| `Package 'so101_mirror' not found` | `source ros_ws/install/setup.zsh`, or the build (step 4) failed |
+| numpy / `_ARRAY_API` errors importing `rclpy` | pip replaced conda's numpy: `conda install numpy=<the original version>`, then redo step 3 with the pin |
+| `camera N: no frames` | wrong number (`stereo_cam.py --list`), camera access not allowed (step 5), or another app has the camera |
+| `camera N gave WxH, asked for 640x480` | that camera can't do the size: check `--list`, or calibrate at the size it gives (`--size W H`) |
+| `SLOW CAMERA` | cameras on one hub (use separate ports), or a dark room (more light) |
+| tracking jumps, `bones` / `rot jump` lines | one view blurry (step 8), a camera moved (redo step 9), or LEFT/RIGHT swapped |
+| `WARNING: WiLoR on the CPU` / very slow | torch has no MPS (step 3 check); an op missing on MPS: run with `PYTORCH_ENABLE_MPS_FALLBACK=1`, or `--wilor-fp32` |
+| `no USB serial device` / `several USB serial devices` | arm board unplugged or unpowered; or pass `--port` (`ls /dev/cu.*`) |
+| `could not open /dev/cu…` | another script has the port open (stop it), or replug the board |
+| `--live` refuses: joint outside its usable range | move that joint by hand into range (see Step C) |
+| IK jumps between solutions | two IK nodes running: stop one, or `export ROS_DOMAIN_ID=77` in all terminals |
