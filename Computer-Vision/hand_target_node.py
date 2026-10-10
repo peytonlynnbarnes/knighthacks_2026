@@ -1,5 +1,6 @@
 #!/home/peyton/kh/.venv/bin/python
-"""Stereo hand tracking -> /ball_position [x y z roll pitch yaw] for the SO-101 IK.
+"""Stereo hand tracking -> /ball_position [x y z roll pitch yaw] for the SO-101 IK,
+plus /gripper (0 open .. 1 closed) from how far the fingers are curled.
 
 Pipeline (see ~/kh/INTEGRATION.md for the /ball_position contract):
     2 cameras -> MediaPipe landmarks per view -> triangulate (calib/stereo.npz)
@@ -19,10 +20,14 @@ Run (venv python + ROS on PYTHONPATH, like feetech_mirror.py):
 
 Controls:
     neutral hand -> arm at --neutral-offset (default 10 cm back, 5 cm down from
-    home, the middle of the reachable box). Hand motion x --scale (0.8).
-    FIST = clutch: the arm holds; open the hand anywhere and it continues
-    from there (re-anchors, no jump).
-    Hand lost / bad frame: nothing is published; the IK holds after 0.5 s.
+    home, the middle of the reachable box). Hand motion x --scale (1.1).
+    Close the hand = close the gripper (proportional: open hand = open,
+    fist = closed). Tune with --grip-open-curl / --grip-closed-curl (the
+    printout shows the current curl).
+    Hide the hand = clutch: nothing is published, the arm and gripper hold
+    (IK after 0.5 s). When the hand comes back after >= --reanchor-s it
+    re-anchors: the arm continues from where it is, no jump. Shorter
+    dropouts (bad frames) don't re-anchor.
     Keys: q/Esc quit, c recalibrate the hand.
 
 Safety: the target starts at home (all zeros, where feetech_mirror --live
@@ -43,7 +48,8 @@ from hand_mapping import HandMapper
 from stereo_cam import RIG_PATH, StereoCam, StereoLandmarks, draw_hand, load_rig
 
 BALL_TOPIC = "/ball_position"  # must match so101_mirror.BALL_TOPIC
-FIST_FRAMES = 3                # debounce for clutch on/off
+GRIP_TOPIC = "/gripper"        # std_msgs/Float64, 0 = open .. 1 = closed (feetech_mirror --gripper)
+GRIP_ALPHA = 0.5               # EMA on the grip value, per frame
 
 
 class Publisher:
@@ -52,15 +58,20 @@ class Publisher:
         if not enabled:
             return
         import rclpy
-        from std_msgs.msg import Float64MultiArray
+        from std_msgs.msg import Float64, Float64MultiArray
         rclpy.init()
-        self.rclpy, self.Msg = rclpy, Float64MultiArray
+        self.rclpy, self.Msg, self.F64 = rclpy, Float64MultiArray, Float64
         self.node = rclpy.create_node("hand_target_node")
         self.pub = self.node.create_publisher(Float64MultiArray, BALL_TOPIC, 10)
+        self.grip_pub = self.node.create_publisher(Float64, GRIP_TOPIC, 10)
 
     def __call__(self, target):
         if self.node is not None:
             self.pub.publish(self.Msg(data=[float(v) for v in target]))
+
+    def grip(self, v):
+        if self.node is not None:
+            self.grip_pub.publish(self.F64(data=float(v)))
 
     def close(self):
         if self.node is not None:
@@ -87,7 +98,7 @@ def main():
     ap.add_argument("--rig", default=RIG_PATH)
     ap.add_argument("--no-ros", action="store_true", help="don't publish, just print")
     ap.add_argument("--reuse-calib", action="store_true", help=f"load {HAND_PATH} instead of calibrating")
-    ap.add_argument("--scale", type=float, default=0.8, help="arm m per hand m")
+    ap.add_argument("--scale", type=float, default=1.1, help="arm m per hand m")
     ap.add_argument("--rot-scale", type=float, default=1.0, help="arm rad per hand rad")
     ap.add_argument("--no-orientation", action="store_true", help="send roll/pitch/yaw = 0")
     ap.add_argument("--neutral-offset", type=float, nargs=3, default=[-0.10, 0.0, -0.05],
@@ -98,6 +109,12 @@ def main():
     ap.add_argument("--mono-fallback", action="store_true",
                     help="track the palm from one camera when the other loses the hand")
     ap.add_argument("--no-view", action="store_true", help="no preview window")
+    ap.add_argument("--grip-open-curl", type=float, default=1.35,
+                    help="finger curl (palm lengths) that counts as fully open")
+    ap.add_argument("--grip-closed-curl", type=float, default=0.85,
+                    help="finger curl that counts as fully closed (fist)")
+    ap.add_argument("--reanchor-s", type=float, default=0.3,
+                    help="hand hidden at least this long (s) -> re-anchor when it returns")
     args = ap.parse_args()
 
     try:
@@ -131,7 +148,7 @@ def main():
     pub = Publisher(not args.no_ros)
     cam = StereoCam(args.cams)
     lms = StereoLandmarks()
-    clutched, fist_n, open_n = False, 0, 0
+    lost_since, grip = None, None  # when the hand disappeared; filtered grip 0..1
     last_print, fps_n, fps_t, fps = 0.0, 0, time.monotonic(), 0.0
     target, why = None, ""
     try:
@@ -151,28 +168,30 @@ def main():
                     print(f"hand calibrated ({calib.msg}); saved {HAND_PATH}")
                     start_tracking(calib.result)
                     calib = None
-                    clutched, fist_n, open_n = False, 0, 0
+                    lost_since = None
                 else:
                     status = calib.instructions()
             elif pose is not None:
-                fist_n, open_n = (fist_n + 1, 0) if pose["fist"] else (0, open_n + 1)
-                if not clutched and fist_n >= FIST_FRAMES:
-                    clutched = True
-                elif clutched and open_n >= FIST_FRAMES:
-                    clutched = False
-                    mapper.reanchor(pose["p"], pose["R"])
-                if clutched:
-                    target = mapper.hold(t)
-                else:
-                    target = mapper.update(pose["p"], pose["R"], t)
+                if lost_since is not None and t - lost_since >= args.reanchor_s:
+                    mapper.reanchor(pose["p"], pose["R"])  # clutch release: no jump
+                lost_since = None
+                target = mapper.update(pose["p"], pose["R"], t)
                 out = target.copy()
                 if args.no_orientation:
                     out[3:] = 0.0
                 pub(out)
                 published = True
-                status = ("CLUTCH (fist): holding" if clutched else "TRACKING") + f" [{pose['mode']}]"
+                status = f"TRACKING [{pose['mode']}]"
+                if pose["curl"] is not None:  # stereo only; mono -> gripper holds
+                    g = (args.grip_open_curl - pose["curl"]) / (args.grip_open_curl - args.grip_closed_curl)
+                    g = min(1.0, max(0.0, g))
+                    grip = g if grip is None else grip + GRIP_ALPHA * (g - grip)
+                    pub.grip(grip)
+                    status += f" grip {grip:.2f} (curl {pose['curl']:.2f})"
             else:
-                status = f"no target: {why}"
+                if lost_since is None:
+                    lost_since = t
+                status = f"no hand (clutch: holding): {why}"
 
             if time.monotonic() - last_print > 0.5:
                 last_print = time.monotonic()
@@ -202,7 +221,7 @@ def main():
                              f"{math.degrees(yw):+.0f}")
             for i, s in enumerate(lines):
                 cv2.putText(view, s, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                            (0, 0, 255) if clutched else (0, 255, 255), 2)
+                            (0, 0, 255) if pose is None else (0, 255, 255), 2)
             cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", view)
             k = cv2.waitKey(1) & 0xFF
             if k in (ord("q"), 27):

@@ -56,7 +56,7 @@ class OneEuro:
 class HandMapper:
     MAX_DT = 0.1  # s
 
-    def __init__(self, A, neutral_p, neutral_R, scale=0.8, rot_scale=1.0,
+    def __init__(self, A, neutral_p, neutral_R, scale=1.1, rot_scale=1.0,
                  neutral_offset=(-0.10, 0.0, -0.05), box_min=BOX_MIN, box_max=BOX_MAX,
                  max_lin_speed=0.25, max_ang_speed=math.radians(120),
                  pos_filter=(1.0, 2.0), rot_filter=(1.0, 0.5)):

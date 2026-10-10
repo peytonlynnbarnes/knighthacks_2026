@@ -5,7 +5,9 @@ Subscribes to /arm/shoulder_pan, /arm/shoulder_lift, /arm/elbow_flex,
 /arm/wrist_flex, /arm/wrist_roll (std_msgs/Float64), converts them to ticks
 (so101_bus.JOINT_CAL), and sync-writes Goal_Position at --rate Hz.
 Publishes the measured pose as sensor_msgs/JointState on /hw/joint_states.
-The gripper (ID 6) is never touched.
+The gripper (ID 6) is only touched with --gripper: then /gripper
+(std_msgs/Float64, 0 = open .. 1 = closed, from hand_target_node.py) maps
+linearly to so101_bus.GRIPPER_OPEN .. GRIPPER_CLOSED ticks.
 
 With --live the arm first eases to its base pose (every arm joint at 2048,
 like base_pose.py), which is IK home and /ball_position [0,0,0,0,0,0]. Only
@@ -43,6 +45,11 @@ Safety:
       (2250 ticks/s ~ 200 deg/s). Use a lower --max-speed for first tests.
     - Ctrl-C / exit: goal = present, torque stays ON (the arm holds, it
       does not go limp). Use torque_off.py to release it.
+    - Gripper (--gripper): torque on holding where it is (no homing), clamped
+      to its usable range, rate limited (--grip-speed), holds when /gripper
+      goes stale. It isn't in the lag/load abort (gripping an object stalls
+      it by design); instead, above GRIP_LOAD it stops closing further and
+      keeps the goal only GRIP_SQUEEZE ticks past where the jaws stopped.
 """
 import argparse
 import math
@@ -75,6 +82,9 @@ MIN_LEAD = 150       # max goal lead over present while following (ticks), at lo
 LEAD_TIME = 0.15     # ...grows with speed: lead = max(MIN_LEAD, LEAD_TIME * speed)
 LOAD_ABORT = 700     # 0.1 % units (70 %)
 HOME_TOL = 15        # ticks to count as arrived at home
+GRIP_TOPIC = "/gripper"  # must match hand_target_node.GRIP_TOPIC
+GRIP_LOAD = 400      # 0.1 % units: above this the gripper is holding something...
+GRIP_SQUEEZE = 40    # ...so its goal stays at most this many ticks past present
 
 
 class Mirror(Node):
@@ -86,6 +96,19 @@ class Mirror(Node):
             self.create_subscription(Float64, ARM_TOPIC_PREFIX + j,
                                      lambda m, j=j: self.on_cmd(j, m.data), 10)
         self.state_pub = self.create_publisher(JointState, "/hw/joint_states", 10)
+        self.grip = None   # (0..1, monotonic time)
+        if args.gripper:
+            self.create_subscription(Float64, GRIP_TOPIC, self.on_grip, 10)
+
+    def on_grip(self, m):
+        if math.isfinite(m.data):
+            self.grip = (min(1.0, max(0.0, m.data)), time.monotonic())
+
+    def fresh_grip(self):
+        """0 (open) .. 1 (closed) if recent, else None (hold)."""
+        if self.grip is None or time.monotonic() - self.grip[1] > self.args.stale_s:
+            return None
+        return self.grip[0]
 
     def on_cmd(self, joint, rad):
         if math.isfinite(rad):
@@ -103,8 +126,9 @@ class Mirror(Node):
     def publish_state(self, present):
         msg = JointState()
         msg.header.stamp = self.get_clock().now().to_msg()
-        msg.name = list(present)
-        msg.position = [sb.ticks_to_rad(j, t) for j, t in present.items()]
+        arm = {j: t for j, t in present.items() if j in sb.JOINT_CAL}  # gripper has no rad cal
+        msg.name = list(arm)
+        msg.position = [sb.ticks_to_rad(j, t) for j, t in arm.items()]
         self.state_pub.publish(msg)
 
 
@@ -177,11 +201,14 @@ def main():
                     help=f"per-joint goal rate limit, ticks/s (default {DEFAULT_SPEED} = 75%% of "
                          f"full speed, max {MAX_SPEED_CAP})")
     ap.add_argument("--stale-s", type=float, default=0.5, help="hold if no command for this long")
+    ap.add_argument("--gripper", action="store_true",
+                    help=f"also drive the gripper (ID 6) from {GRIP_TOPIC}")
+    ap.add_argument("--grip-speed", type=float, default=1500.0, help="gripper rate limit, ticks/s")
     ap.add_argument("--home-speed", type=float, default=400.0,
                     help=f"ticks/s for the largest joint while homing (max {MAX_SPEED_CAP})")
     args = ap.parse_args()
 
-    for name in ("max_speed", "home_speed"):
+    for name in ("max_speed", "home_speed", "grip_speed"):
         if not 0 < getattr(args, name) <= MAX_SPEED_CAP:
             sys.exit(f"--{name.replace('_', '-')} must be in (0, {MAX_SPEED_CAP}]")
     if not 0 < args.alpha <= 1:
@@ -193,15 +220,21 @@ def main():
     node = Mirror(args)
     bus = None
     sids = {j: sb.IDS[j] for j in ARM_JOINTS}
+    gsid = sb.IDS["gripper"] if args.gripper else None
+    all_sids = dict(sids, gripper=gsid) if gsid is not None else dict(sids)
+    hold_ids = list(all_sids.values())
+    grip_close_dir = 1 if sb.GRIPPER_CLOSED > sb.GRIPPER_OPEN else -1
+    gload = 0
     limits, eeprom, present, goals = {}, {}, {}, {}
     torque = False
     dt = 1.0 / args.rate
     max_step = args.max_speed * dt
+    grip_step = args.grip_speed * dt
     lead = max_lead(args.max_speed)
     try:
         if not args.no_bus:
             bus = sb.Bus(args.port)
-            for j, sid in sids.items():
+            for j, sid in all_sids.items():
                 if not bus.ping(sid):
                     sys.exit(f"servo {sid} ({j}) not responding")
                 eeprom[j] = bus.limits(sid)
@@ -222,7 +255,7 @@ def main():
                         sys.exit(msg)
                     print("WARNING (would refuse --live): " + msg)
             print("present pose (rad, via JOINT_CAL):",
-                  {j: round(sb.ticks_to_rad(j, t), 3) for j, t in present.items()})
+                  {j: round(sb.ticks_to_rad(j, present[j]), 3) for j in ARM_JOINTS})
             print("homing plan (present -> base pose):")
             for j in ARM_JOINTS:
                 d = sb.HOME[j] - present[j]
@@ -230,17 +263,22 @@ def main():
                       f"{d * 360 / 4096:+6.1f} deg)  limits {list(limits[j])}")
 
         if args.live:
-            print(f"LIVE: torque will be enabled on {', '.join(ARM_JOINTS)}, the arm will "
+            print(f"LIVE: torque will be enabled on {', '.join(all_sids)}, the arm will "
                   f"move to its base pose (plan above, {args.home_speed:.0f} ticks/s), then "
                   f"follow /arm/* at <= {args.max_speed:.0f} ticks/s "
                   f"({args.max_speed * 360 / 4096:.0f} deg/s).\n"
-                  "JOINT_CAL must be verified first. Keep the area clear; Ctrl-C holds.")
+                  + (f"The gripper follows {GRIP_TOPIC} (holds where it is until then).\n"
+                     if gsid is not None else "")
+                  + "JOINT_CAL must be verified first. Keep the area clear; Ctrl-C holds.")
             if not args.yes and input("Proceed? [y/N] ").strip().lower() != "y":
                 sys.exit("aborted, nothing changed")
-            for j, sid in sids.items():
+            for j, sid in all_sids.items():
                 goals[j] = float(bus.torque_on_holding(sid, SERVO_ACCEL, SERVO_SPEED))
             torque = True
-            goals = home(bus, sids, goals, args.home_speed, dt)
+            grip_start = goals.get("gripper")
+            goals = home(bus, sids, {j: goals[j] for j in sids}, args.home_speed, dt)
+            if grip_start is not None:
+                goals["gripper"] = grip_start  # the gripper isn't homed; it holds
         else:
             print("DRY RUN: no torque, no goal writes. Pass --live to move.\n")
 
@@ -256,6 +294,9 @@ def main():
             if bus is not None:
                 for j, sid in sids.items():
                     present[j] = bus.position(sid)
+                if gsid is not None:
+                    present["gripper"] = bus.position(gsid)
+                    gload = bus.load(gsid)
                 node.publish_state(present)
 
             if targets is None:
@@ -279,17 +320,38 @@ def main():
                 if torque:
                     bus.send_goals({sids[j]: goals[j] for j in ARM_JOINTS})
 
+            grip = node.fresh_grip() if gsid is not None else None
+            grip_raw = None
+            if grip is not None:
+                lo, hi = limits.get("gripper", (0, 4095))
+                grip_raw = max(lo, min(hi, sb.GRIPPER_OPEN + (sb.GRIPPER_CLOSED - sb.GRIPPER_OPEN) * grip))
+                if torque:
+                    step = max(-grip_step, min(grip_step, grip_raw - goals["gripper"]))
+                    g = goals["gripper"] + step
+                    past = (g - present["gripper"]) * grip_close_dir  # how far the goal is past the jaws
+                    if abs(gload) > LOAD_ABORT:
+                        g = present["gripper"]  # way overloaded: stop pushing entirely
+                    elif abs(gload) > GRIP_LOAD and past > GRIP_SQUEEZE:
+                        g = present["gripper"] + grip_close_dir * GRIP_SQUEEZE  # holding: don't squeeze harder
+                    goals["gripper"] = max(lo, min(hi, g))
+                    bus.send_goals({gsid: goals["gripper"]})
+
             if torque:
                 for j, sid in sids.items():
                     lag = abs(goals[j] - present[j])
                     load = bus.load(sid)
                     if lag > lag_limit(args.max_speed) or abs(load) > LOAD_ABORT:
-                        held = bus.hold(list(sids.values()))
+                        held = bus.hold(hold_ids)
                         sys.exit(f"ABORT: {j} lag {lag:.0f} ticks, load {load / 10:.0f}%. "
                                  f"Holding at {held}.")
 
             if not args.live and time.monotonic() - last_print > 0.5:
                 print_table(targets, present, limits, filt)
+                if gsid is not None:
+                    print(f"gripper: cmd {'-' if grip is None else f'{grip:.2f}'} -> ticks "
+                          f"{'-' if grip_raw is None else f'{grip_raw:.0f}'}, present "
+                          f"{present.get('gripper', '-')}, load {gload / 10:.0f}%  "
+                          f"(open {sb.GRIPPER_OPEN}, closed {sb.GRIPPER_CLOSED})\n")
                 last_print = time.monotonic()
 
             time.sleep(max(0.0, dt - (time.monotonic() - t0)))
@@ -300,7 +362,7 @@ def main():
     finally:
         if bus is not None:
             if torque:
-                print(f"\nstopped, holding at {bus.hold(list(sids.values()))} (torque ON)")
+                print(f"\nstopped, holding at {bus.hold(hold_ids)} (torque ON)")
             if bus.retries:
                 print(f"bus: {bus.retries} transaction(s) needed a retry this run")
             bus.close()

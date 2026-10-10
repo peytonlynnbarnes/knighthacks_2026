@@ -68,6 +68,12 @@ SOFT_LIMITS = {
     "gripper": (2007, 3523),
 }
 
+# Gripper command range (ticks), for feetech_mirror --gripper. Closed jaws read
+# ~2030 (user-confirmed 2026-10-10), so low ticks = closed. Open stops short of
+# the EEPROM max (3298). Closing past an object is limited by load, not by this.
+GRIPPER_CLOSED = 2040
+GRIPPER_OPEN = 2900
+
 
 def effective_limits(name, eeprom):
     """Intersection of the EEPROM limits and SOFT_LIMITS (ticks)."""

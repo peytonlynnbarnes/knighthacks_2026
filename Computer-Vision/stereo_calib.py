@@ -10,7 +10,7 @@ Mode 1 (default, no equipment): calibrate from your hand.
     landmark matches gives cam1's rotation and direction; the measured
     baseline (--baseline-in, default 9.5 in) gives the scale. Intrinsics are a pinhole guess from --hfov (no lens
     distortion), so absolute depth can be off by the hfov error; relative
-    motion (what the arm uses, at 0.8x) is what matters.
+    motion (what the arm uses, at 1.1x) is what matters.
 
 Mode 2 (more accurate): a chessboard shown on a phone/tablet screen.
     .venv/bin/python Computer-Vision/stereo_calib.py --board

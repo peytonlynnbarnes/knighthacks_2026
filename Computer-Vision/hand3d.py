@@ -127,6 +127,14 @@ def bones_ok(P, ref, tol):
     return bool(np.all(np.abs(r - 1) < tol))
 
 
+def curl(P):
+    """Finger curl: median fingertip (index..pinky) distance from the palm center,
+    in palm lengths (wrist -> middle MCP). ~1.4+ open hand, < ~0.9 fist."""
+    c = palm_center(P)
+    palm_len = np.linalg.norm(P[MIDDLE_MCP] - P[WRIST])
+    return float(np.median(np.linalg.norm(P[FINGERTIPS] - c, axis=1)) / palm_len)
+
+
 def is_fist(P):
     """Fingertips (index..pinky) curled close to the palm center."""
     c = palm_center(P)
@@ -222,7 +230,7 @@ class StereoHand:
                 reason = "bones"
             else:
                 p, R = hand_frame(P)
-                return dict(P=P, p=p, R=R, fist=is_fist(P), mode="stereo", err=err), ""
+                return dict(P=P, p=p, R=R, fist=is_fist(P), curl=curl(P), mode="stereo", err=err), ""
             # stereo failed validation: fall through to mono if allowed
         else:
             reason = "no hand" if px0 is None and px1 is None else "one view"
@@ -239,7 +247,7 @@ class StereoHand:
             P = np.full((21, 3), np.nan)
             P[PALM] = X
             p, R = hand_frame(P)
-            return dict(P=P, p=p, R=R, fist=False, mode=f"mono{k}", err=float("nan")), ""
+            return dict(P=P, p=p, R=R, fist=False, curl=None, mode=f"mono{k}", err=float("nan")), ""
         return None, reason
 
 
