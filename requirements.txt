@@ -10,11 +10,11 @@
 feetech-servo-sdk==1.0.0
 pyyaml                 # rclpy needs it when ROS is used from this env (feetech_mirror.py)
 
-# numpy: the version conda's ROS 2 Jazzy was built with (1.26.4, like the Ubuntu setup);
-# never let pip move it to 2.x
-numpy==1.26.4
+# numpy: NOT pinned here. ROS's message packages are built against whatever numpy conda installed
+# (RoboStack Jazzy currently ships 2.x, e.g. 2.2.6; the Ubuntu setup used 1.26.4), so it is pinned
+# by the -c constraint file above. Never let pip change it.
 
-# cameras + geometry: OpenCV 4.12+ requires numpy 2, which breaks the pin above
+# cameras + geometry (4.10/4.11 work with numpy 1.26 and 2.x)
 opencv-python<4.12
 
 # WiLoR (Computer-Vision/WiLoR/; weights + MANO in WiLoR/repo/, copied by hand, never committed)
