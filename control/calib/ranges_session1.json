@@ -1,0 +1,9 @@
+{
+  "_note": "Hand-measured full range of motion, torque off, 2026-10-09, one joint at a time. Raw Present_Position ticks, overall min/max across the whole recording (calib/range_session1.csv, record_range.py). wrist_roll crosses the 0/4095 seam: its arc runs 2878 -> 4095/0 -> 2645, and the gap 2645..2878 (~20 deg) was never reached.",
+  "shoulder_pan":  {"min": 1272, "max": 3000, "eeprom": [788, 3504]},
+  "shoulder_lift": {"min": 815,  "max": 3199, "eeprom": [1067, 3476]},
+  "elbow_flex":    {"min": 944,  "max": 3176, "eeprom": [627, 2879]},
+  "wrist_flex":    {"min": 694,  "max": 3071, "eeprom": [833, 3229]},
+  "wrist_roll":    {"wraps": true, "arc_start": 2878, "arc_end": 2645, "span_ticks": 3863, "eeprom": [0, 4095]},
+  "gripper":       {"min": 2007, "max": 3523, "eeprom": [1789, 3298]}
+}

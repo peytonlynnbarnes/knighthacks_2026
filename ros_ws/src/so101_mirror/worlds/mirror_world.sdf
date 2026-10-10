@@ -1,0 +1,124 @@
+<?xml version="1.0" ?>
+<!--
+  End-effector mirror world: SO-101 base at the world origin (spawned by the
+  launch file) and a floating target ball with an orientation arrow.
+
+  The ball:
+    - kinematic + no gravity + no collision: it stays wherever you put it and
+      the arm can pass through it. Move/rotate it with the Gazebo GUI
+      translate (T) / rotate (R) tools, or with ball_sweep.py.
+    - it spawns at HOME: the end-effector position of the base pose (all
+      joints 2048), so /ball_position starts at [0,0,0,0,0,0]. Keep this
+      pose equal to so101_mirror.model.home_pose() (FK at q = 0).
+    - the red arrow is the ball's +X axis, which at home is the gripper
+      approach direction. Rotating the ball rotates the gripper from its home
+      orientation. Green tick = +Y, so roll is visible too.
+    - PosePublisher publishes its world pose on gz topic /model/ball/pose,
+      which the launch file bridges to ROS /sim/ball_pose.
+-->
+<sdf version="1.10">
+  <world name="mirror_world">
+
+    <physics name="4ms" type="ignored">
+      <max_step_size>0.004</max_step_size>
+      <real_time_factor>1.0</real_time_factor>
+    </physics>
+
+    <plugin filename="gz-sim-physics-system" name="gz::sim::systems::Physics"/>
+    <plugin filename="gz-sim-user-commands-system" name="gz::sim::systems::UserCommands"/>
+    <plugin filename="gz-sim-scene-broadcaster-system" name="gz::sim::systems::SceneBroadcaster"/>
+
+    <gui fullscreen="0">
+      <camera name="user_camera">
+        <pose>0.75 -0.65 0.55 0 0.45 2.4</pose>
+      </camera>
+    </gui>
+
+    <light type="directional" name="sun">
+      <cast_shadows>true</cast_shadows>
+      <pose>0 0 10 0 0 0</pose>
+      <diffuse>0.8 0.8 0.8 1</diffuse>
+      <specular>0.2 0.2 0.2 1</specular>
+      <direction>-0.5 0.1 -0.9</direction>
+    </light>
+
+    <model name="ground_plane">
+      <static>true</static>
+      <link name="link">
+        <collision name="collision">
+          <geometry><plane><normal>0 0 1</normal><size>10 10</size></plane></geometry>
+        </collision>
+        <visual name="visual">
+          <geometry><plane><normal>0 0 1</normal><size>10 10</size></plane></geometry>
+          <material>
+            <ambient>0.8 0.8 0.8 1</ambient>
+            <diffuse>0.8 0.8 0.8 1</diffuse>
+          </material>
+        </visual>
+      </link>
+    </model>
+
+    <model name="ball">
+      <pose>0.3914 0.0 0.2265 0 0 0</pose>
+      <link name="link">
+        <kinematic>true</kinematic>
+        <gravity>false</gravity>
+        <inertial>
+          <mass>0.05</mass>
+          <inertia>
+            <ixx>1.25e-5</ixx><iyy>1.25e-5</iyy><izz>1.25e-5</izz>
+            <ixy>0</ixy><ixz>0</ixz><iyz>0</iyz>
+          </inertia>
+        </inertial>
+
+        <visual name="sphere">
+          <geometry><sphere><radius>0.02</radius></sphere></geometry>
+          <material>
+            <ambient>0.9 0.6 0.1 1</ambient>
+            <diffuse>0.9 0.6 0.1 1</diffuse>
+          </material>
+        </visual>
+
+        <!-- arrow along +X: shaft (cylinder axis is Z, so pitch it +90 deg) -->
+        <visual name="arrow_shaft">
+          <pose>0.045 0 0 0 1.5708 0</pose>
+          <geometry><cylinder><radius>0.004</radius><length>0.05</length></cylinder></geometry>
+          <material>
+            <ambient>0.9 0.05 0.05 1</ambient>
+            <diffuse>0.9 0.05 0.05 1</diffuse>
+          </material>
+        </visual>
+        <visual name="arrow_head">
+          <pose>0.08 0 0 0 1.5708 0</pose>
+          <geometry><cone><radius>0.01</radius><length>0.02</length></cone></geometry>
+          <material>
+            <ambient>0.9 0.05 0.05 1</ambient>
+            <diffuse>0.9 0.05 0.05 1</diffuse>
+          </material>
+        </visual>
+
+        <!-- short +Y tick so roll about the arrow is visible -->
+        <visual name="y_tick">
+          <pose>0 0.03 0 -1.5708 0 0</pose>
+          <geometry><cylinder><radius>0.003</radius><length>0.025</length></cylinder></geometry>
+          <material>
+            <ambient>0.1 0.8 0.1 1</ambient>
+            <diffuse>0.1 0.8 0.1 1</diffuse>
+          </material>
+        </visual>
+      </link>
+
+      <plugin filename="gz-sim-pose-publisher-system" name="gz::sim::systems::PosePublisher">
+        <publish_model_pose>true</publish_model_pose>
+        <publish_link_pose>false</publish_link_pose>
+        <publish_nested_model_pose>false</publish_nested_model_pose>
+        <publish_visual_pose>false</publish_visual_pose>
+        <publish_collision_pose>false</publish_collision_pose>
+        <publish_sensor_pose>false</publish_sensor_pose>
+        <use_pose_vector_msg>false</use_pose_vector_msg>
+        <update_frequency>50</update_frequency>
+      </plugin>
+    </model>
+
+  </world>
+</sdf>

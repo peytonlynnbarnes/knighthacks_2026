@@ -1,0 +1,8 @@
+CLAUDE.md
+INTEGRATION.md
+control/CLAUDE.md
+.venv
+ros_ws/build/
+ros_ws/install/
+ros_ws/log/
+__pycache__/

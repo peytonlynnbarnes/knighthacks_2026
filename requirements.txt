@@ -1,0 +1,5 @@
+feetech-servo-sdk==1.0.0
+pyyaml  # rclpy needs it when ROS is used from this venv (feetech_mirror.py)
+numpy==1.26.4  # same as system numpy that ROS Jazzy msgs are built against
+mediapipe==1.1.0  # hand landmarks (mediapipe/hand_tracker.py)
+opencv-contrib-python<4.12  # pulled in by mediapipe; 4.12+ needs numpy 2, which breaks the pin above
