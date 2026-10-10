@@ -23,6 +23,8 @@ Run (venv python + ROS on PYTHONPATH, like feetech_mirror.py):
     .venv/bin/python Computer-Vision/common/hand_target_node.py --no-ros   # print only
     .venv/bin/python Computer-Vision/common/hand_target_node.py            # publish
     Computer-Vision/WiLoR/.venv/bin/python Computer-Vision/common/hand_target_node.py --backend wilor
+    # WiLoR on the cloud GPU (wilor_server.py + SSH tunnel, see ../WiLoR-server/remote_landmarks.py):
+    WILOR_TOKEN=<secret> .venv/bin/python Computer-Vision/common/hand_target_node.py --backend wilor-remote
     # IK without the Gazebo ball:
     ros2 launch so101_mirror sim.launch.py ball_source:=false   (or ros2 run so101_mirror ik_node.py)
 
@@ -265,13 +267,19 @@ def main():
     ap.add_argument("--rig", default=RIG_PATH)
     ap.add_argument("--no-ros", action="store_true", help="don't publish, just print")
     ap.add_argument("--backend", choices=BACKENDS, default="mediapipe",
-                    help="landmarks: mediapipe (CPU, ~/kh/.venv) or wilor (MANO model, CUDA, run with "
-                         "Computer-Vision/WiLoR/.venv/bin/python); see Computer-Vision/WILOR_PLAN.md")
+                    help="landmarks: mediapipe (CPU, ~/kh/.venv), wilor (MANO model, CUDA, run with "
+                         "Computer-Vision/WiLoR/.venv/bin/python; see Computer-Vision/WILOR_PLAN.md) or "
+                         "wilor-remote (WiLoR on the cloud GPU via the SSH tunnel, ~/kh/.venv, WILOR_TOKEN)")
     ap.add_argument("--wilor-hand", choices=["any", "right", "left"], default="any",
                     help="wilor: track only this hand (default: whichever it finds, then keep it)")
     ap.add_argument("--wilor-yolo-every", type=int, default=4,
                     help="wilor: run the hand detector every N frames (in between, boxes follow the keypoints)")
     ap.add_argument("--wilor-fp32", action="store_true", help="wilor: float32 (~3x slower)")
+    ap.add_argument("--wilor-url", default="http://localhost:8000",
+                    help="wilor-remote: the server, i.e. the SSH tunnel's local end")
+    ap.add_argument("--wilor-inflight", type=int, default=4,
+                    help="wilor-remote: requests on the wire at once (pairs/s ~ this / round trip; "
+                         "each result is still one round trip old)")
     ap.add_argument("--scale", type=float, default=1.0, help="arm m per hand m")
     ap.add_argument("--rot-scale", type=float, default=1.0,
                     help="multiplies all the rotation gains below")
@@ -453,8 +461,10 @@ def main():
               f"{cam.argv or '(defaults)'}")
     else:
         # backend first: WiLoR takes ~15 s to load, and a wrong venv fails before the cameras open
-        kw = ({} if args.backend == "mediapipe" else
-              dict(hand=args.wilor_hand, yolo_every=args.wilor_yolo_every, fp32=args.wilor_fp32))
+        kw = {"mediapipe": {},
+              "wilor": dict(hand=args.wilor_hand, yolo_every=args.wilor_yolo_every, fp32=args.wilor_fp32),
+              "wilor-remote": dict(hand=args.wilor_hand, url=args.wilor_url, inflight=args.wilor_inflight),
+              }[args.backend]
         lms = make_landmarks(args.backend, **kw)
         print(f"landmarks: {args.backend}")
         if args.replay_frames:
@@ -470,6 +480,8 @@ def main():
             if focus is None:
                 print("  autofocus: the focal length may drift from the calibration; calibrate with "
                       "stereo_calib.py --focus N to lock it")
+        if hasattr(lms, "wrap"):  # wilor-remote: keep several pairs on the wire, get them back in order
+            cam = lms.wrap(cam)
     skew = None if args.no_skew_correct else h3.SkewCorrector()
     lost_since, grip = None, None  # when the hand disappeared; filtered grip 0..1
     last_print, fps_n, fps_t, fps = 0.0, 0, time.monotonic(), 0.0

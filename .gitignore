@@ -2,6 +2,7 @@ CLAUDE.md
 INTEGRATION.md
 control/CLAUDE.md
 .venv
+.ssh
 ros_ws/build/
 ros_ws/install/
 ros_ws/log/

@@ -40,25 +40,30 @@ import cv2
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-CV_DIR = os.path.dirname(HERE)  # Computer-Vision/: common/ (this), MediaPipe/, WiLoR/
-BACKENDS = ("mediapipe", "wilor")  # landmark backends: ../MediaPipe/, ../WiLoR/
-BACKEND_VENV = {"mediapipe": "~/kh/.venv", "wilor": "~/kh/Computer-Vision/WiLoR/.venv"}
+CV_DIR = os.path.dirname(HERE)  # Computer-Vision/: common/ (this), MediaPipe/, WiLoR/, WiLoR-server/
+BACKENDS = ("mediapipe", "wilor", "wilor-remote")  # landmark backends: ../MediaPipe/, ../WiLoR/, ../WiLoR-server/
+BACKEND_VENV = {"mediapipe": "~/kh/.venv", "wilor": "~/kh/Computer-Vision/WiLoR/.venv", "wilor-remote": "~/kh/.venv"}
+BACKEND_DIR = {"mediapipe": "MediaPipe", "wilor": "WiLoR", "wilor-remote": "WiLoR-server"}
 
 
 def make_landmarks(backend="mediapipe", **kw):
     """The landmark backend: StereoLandmarks(f0, f1, t) -> (px0, px1), (21, 2) pixels
     per view or None. mediapipe = ../MediaPipe/mediapipe_landmarks.py (CPU),
-    wilor = ../WiLoR/wilor_landmarks.py (MANO model, CUDA; kw: hand, yolo_every, fp32)."""
+    wilor = ../WiLoR/wilor_landmarks.py (MANO model, CUDA; kw: hand, yolo_every, fp32),
+    wilor-remote = ../WiLoR-server/remote_landmarks.py (WiLoR on the cloud GPU through an SSH
+    tunnel; kw: hand, url, inflight; has wrap(cam) for pipelined requests)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend {backend!r}: one of {BACKENDS}")
-    d = os.path.join(CV_DIR, {"mediapipe": "MediaPipe", "wilor": "WiLoR"}[backend])
+    d = os.path.join(CV_DIR, BACKEND_DIR[backend])
     if d not in sys.path:
         sys.path.insert(0, d)
     try:
         if backend == "mediapipe":
             from mediapipe_landmarks import StereoLandmarks
-        else:
+        elif backend == "wilor":
             from wilor_landmarks import StereoLandmarks
+        else:
+            from remote_landmarks import StereoLandmarks
         return StereoLandmarks(**kw)
     except ImportError as e:
         raise SystemExit(f"{backend} backend: {e}. Run it with {BACKEND_VENV[backend]}/bin/python")

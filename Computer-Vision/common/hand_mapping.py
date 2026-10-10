@@ -215,6 +215,9 @@ KALMAN_DEFAULTS = {
     "mediapipe": dict(sigma_px=4.0, q=0.001),
     "wilor": dict(sigma_px=1.0, q=0.0001),  # vs (4, 0.001): moving error -45..65%, still equal
 }
+# the cloud server runs the same WiLoR weights (WiLoR-mini, fp16): WiLoR's presets until it has its own
+IMM_PRESETS["wilor-remote"] = IMM_PRESETS["wilor"]
+KALMAN_DEFAULTS["wilor-remote"] = KALMAN_DEFAULTS["wilor"]
 
 
 class StereoIMM:
