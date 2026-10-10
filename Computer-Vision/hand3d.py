@@ -251,6 +251,48 @@ class StereoHand:
         return None, reason
 
 
+def twist_x(R):
+    """Twist angle (rad) of rotation R about its body x axis (swing-twist split)."""
+    v = matrix_to_rotvec(R)
+    th = float(np.linalg.norm(v))
+    if th < 1e-12:
+        return 0.0
+    return 2.0 * math.atan2(math.sin(th / 2) * v[0] / th, math.cos(th / 2))
+
+
+# ---------- two hands: which detection is which ----------
+
+def assign_hands(hands0, hands1, main="right", mirrored=False):
+    """Split each camera's detections into the user's main and other hand.
+
+    hands0/hands1: [(px, mediapipe_label, score), ...] per camera.
+    MediaPipe labels assume a mirrored (selfie) image; webcam frames here are
+    not mirrored, so "Left" = the user's right hand (mirrored=True undoes that).
+    Fallbacks: two hands with the same label in one view -> split by image x
+    (facing the user, their right hand is on the image's left); one hand per
+    view with conflicting labels -> both take the more confident label.
+    A wrong pairing still fails triangulation's reprojection check downstream.
+    Returns ((main_px0, main_px1), (other_px0, other_px1)), None where absent.
+    """
+    flip = {"Left": "right", "Right": "left"} if not mirrored else {"Left": "left", "Right": "right"}
+
+    def sides(hands):
+        s = [flip.get(lbl, "right") for _, lbl, _ in hands]
+        if len(hands) >= 2 and s[0] == s[1]:
+            xs = [px[:, 0].mean() for px, _, _ in hands[:2]]
+            first_right = (xs[0] < xs[1]) != mirrored  # image-left = user's right (unmirrored)
+            s[:2] = ["right", "left"] if first_right else ["left", "right"]
+        return s
+
+    s0, s1 = sides(hands0), sides(hands1)
+    if len(hands0) == 1 and len(hands1) == 1 and s0[0] != s1[0]:
+        s0 = s1 = [s0[0]] if hands0[0][2] >= hands1[0][2] else [s1[0]]
+    other = "left" if main == "right" else "right"
+    pick = lambda hands, s, side: next((h[0] for h, x in zip(hands, s) if x == side), None)  # noqa: E731
+    return ((pick(hands0, s0, main), pick(hands1, s1, main)),
+            (pick(hands0, s0, other), pick(hands1, s1, other)))
+
+
 # ---------- self-calibration of stereo extrinsics from hand landmarks ----------
 
 def stereo_from_correspondences(n0, n1, baseline_m):
@@ -374,6 +416,19 @@ def _selftest():
     assert np.allclose(A @ [0, -1, 0], [0, 0, 1])             # image up -> robot +Z
     assert np.allclose(A @ [-1, 0, 0], [0, 1, 0], atol=1e-9)  # cam -x -> robot +Y (left)
     assert np.isclose(np.linalg.det(A), 1.0)
+    # two-hand assignment (unmirrored: MediaPipe "Left" = user's right)
+    A_, B_ = np.zeros((21, 2)) + 100, np.zeros((21, 2)) + 500  # A_ on the image left
+    (m0, m1), (o0, o1) = assign_hands([(A_, "Left", .9), (B_, "Right", .9)], [(A_, "Left", .9)])
+    assert m0 is A_ and o0 is B_ and m1 is A_ and o1 is None
+    (m0, _), (o0, _) = assign_hands([(B_, "Left", .9), (A_, "Left", .8)], [])  # same label: by x
+    assert m0 is A_ and o0 is B_
+    (m0, m1), (o0, o1) = assign_hands([(A_, "Left", .6)], [(A_, "Right", .9)])  # conflict
+    assert m0 is None and m1 is None and o0 is A_ and o1 is A_
+    (m0, _), _ = assign_hands([(A_, "Right", .9)], [], main="left")
+    assert m0 is A_
+    # twist about x: pure x rotation exact, swing about y/z adds none
+    assert abs(twist_x(rpy_to_matrix(0.7, 0, 0)) - 0.7) < 1e-9
+    assert abs(twist_x(rpy_to_matrix(0, 0.5, 0))) < 1e-9 and abs(twist_x(rpy_to_matrix(0, 0, -0.4))) < 1e-9
     print("hand3d self-test OK")
 
 

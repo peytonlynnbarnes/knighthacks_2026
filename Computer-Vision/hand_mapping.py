@@ -17,7 +17,7 @@ import math
 
 import numpy as np
 
-from hand3d import matrix_to_rotvec, matrix_to_rpy, rotvec_to_matrix
+from hand3d import matrix_to_rotvec, matrix_to_rpy, rotvec_to_matrix, twist_x
 
 # conservative offset box from INTEGRATION.md (home is near full forward reach)
 BOX_MIN = np.array([-0.20, -0.15, -0.15])
@@ -119,6 +119,71 @@ class HandMapper:
         return np.concatenate([self.cur_p, matrix_to_rpy(self.cur_R)])
 
 
+class RollFilter:
+    """Wrist-hand twist -> steady wrist_roll command (rad). Pure, no ROS.
+
+    Relative: the twist about the hand's finger axis since it was anchored
+    (when it appeared) is added to the roll at that moment. Then, per frame:
+      - fingers opening/closing (curl speed > curl_rate palm lengths/s):
+        re-anchor every frame, so gripping can't twist the wrist
+      - palm edge-on to the camera (|normal . view| < edge_cos): hold, the
+        twist estimate is unreliable there
+      - a jump > jump rad from the last accepted value: ignored unless
+        `confirm` consecutive frames agree (one-frame glitches)
+      - one-euro smoothing, then at most max_speed rad/s
+    update() returns (command, state) with state in track / anchor / grip /
+    edge / jump; call lost(t) on frames without the hand.
+    """
+
+    def __init__(self, sign=1.0, scale=1.0, lo=-2.70, hi=0.90, max_speed=math.radians(90),
+                 jump=math.radians(35), confirm=3, curl_rate=0.8, edge_cos=0.25,
+                 reanchor_s=0.3, filt=(1.5, 0.5)):
+        self.sign, self.scale, self.lo, self.hi = sign, scale, lo, hi
+        self.max_speed, self.jump, self.confirm = max_speed, jump, confirm
+        self.curl_rate, self.edge_cos, self.reanchor_s = curl_rate, edge_cos, reanchor_s
+        self.f = OneEuro(*filt)
+        self.cmd = self.raw = self.base = 0.0
+        self.anchor = self.lost_since = self.t = self.curl = self.pending = None
+        self.curl_v, self.n = 0.0, 0
+
+    def lost(self, t):
+        if self.lost_since is None:
+            self.lost_since = t
+
+    def update(self, R, curl, facing, t):
+        dt = 0.0 if self.t is None else min(max(0.0, t - self.t), HandMapper.MAX_DT)
+        self.t = t
+        if curl is not None and self.curl is not None and dt > 0:
+            # peak-hold with decay: reacts on the first frame the fingers move
+            self.curl_v = max(abs(curl - self.curl) / dt, 0.5 * self.curl_v)
+        if curl is not None:
+            self.curl = curl
+        hidden = self.lost_since is not None and t - self.lost_since >= self.reanchor_s
+        self.lost_since = None
+        gripping = self.curl_v > self.curl_rate
+        if self.anchor is None or hidden or gripping:
+            self.anchor, self.base, self.pending = R, self.raw, None
+            state = "grip" if gripping else "anchor"
+        elif facing < self.edge_cos:
+            state = "edge"
+        else:
+            cand = min(self.hi, max(self.lo, self.base + self.sign * self.scale * twist_x(self.anchor.T @ R)))
+            state = "track"
+            if abs(cand - self.raw) <= self.jump:
+                self.raw, self.pending = cand, None
+            else:
+                self.n = self.n + 1 if self.pending is not None and abs(cand - self.pending) <= self.jump / 2 else 1
+                self.pending = cand
+                if self.n >= self.confirm:
+                    self.raw, self.pending = cand, None
+                else:
+                    state = "jump"
+        target = float(self.f(np.array([self.raw]), t)[0])
+        lim = self.max_speed * dt
+        self.cmd += min(lim, max(-lim, target - self.cmd))
+        return self.cmd, state
+
+
 def _selftest():
     from hand3d import robot_axes, rpy_to_matrix
     A = robot_axes([0, 0, 1])  # moving the hand away from the cameras = robot +X
@@ -160,6 +225,34 @@ def _selftest():
     before = m2.update(p0, np.eye(3), 0.2)
     out = m2.update(p0 + [0.3, 0.3, 0.3], np.eye(3), 5.2)
     assert np.linalg.norm(out[:3] - before[:3]) <= 0.25 * HandMapper.MAX_DT + 1e-9
+    # RollFilter: twist about the hand's x (finger) axis, ~10 fps
+    from hand3d import rpy_to_matrix as rpy
+    rf, t = RollFilter(hi=3.0), 0.0
+    rf.update(np.eye(3), 1.3, 1.0, t)  # anchors at roll 0
+    for k in range(1, 31):  # twist to 60 deg over 1 s, then hold 2 s
+        t += 0.1
+        out, st = rf.update(rpy(math.radians(min(60, 6 * k)), 0, 0), 1.3, 1.0, t)
+    assert abs(math.degrees(out) - 60) < 2 and st == "track", (math.degrees(out), st)
+    t += 0.1  # one-frame glitch +80 deg: ignored
+    out, st = rf.update(rpy(math.radians(140), 0, 0), 1.3, 1.0, t)
+    assert st == "jump" and abs(math.degrees(out) - 60) < 2, (math.degrees(out), st)
+    for k in range(5):  # fingers closing fast while the twist estimate drifts 40 deg: no roll
+        t += 0.1
+        out, st = rf.update(rpy(math.radians(60 + 8 * k), 0, 0), 1.3 - 0.1 * k, 1.0, t)
+    assert st == "grip" and abs(math.degrees(out) - 60) < 2, (math.degrees(out), st)
+    for _ in range(10):  # fingers still again at the drifted pose: stays put (re-anchored)
+        t += 0.1
+        out, st = rf.update(rpy(math.radians(92), 0, 0), 0.9, 1.0, t)
+    assert abs(math.degrees(out) - 60) < 2, math.degrees(out)
+    t += 0.1  # palm edge-on: hold
+    out, st = rf.update(rpy(math.radians(120), 0, 0), 0.9, 0.1, t)
+    assert st == "edge" and abs(math.degrees(out) - 60) < 2
+    rf2, t2 = RollFilter(max_speed=math.radians(90)), 0.0  # speed limit: 0.5 s for at most 45 deg
+    rf2.update(np.eye(3), 1.3, 1.0, t2)
+    for k in range(5):
+        t2 += 0.1
+        out, _ = rf2.update(rpy(math.radians(-30 * min(k + 1, 1)), 0, 0), 1.3, 1.0, t2)
+    assert abs(math.degrees(out)) <= 45 + 1e-6, math.degrees(out)
     print("hand_mapping self-test OK")
 
 

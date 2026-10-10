@@ -187,12 +187,16 @@ def _dls(J, damping):
 
 def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
              max_iters=150, pos_tol=1e-4, damping=0.005, rot_weight=0.5,
-             posture_gain=0.1, max_step=0.2):
+             posture_gain=0.1, max_step=0.2, lock=None):
     """Task-priority IK. R_target=None means position only.
+    lock: {joint index: value} joints held fixed (the others solve around them).
 
     Returns IKResult; it is the caller's job to reject large pos_err."""
     n = len(chain.active)
     q = np.zeros(n) if q0 is None else np.array(q0, dtype=float)
+    free = np.ones(n, dtype=bool)
+    for i, v in (lock or {}).items():
+        q[i], free[i] = v, False
     q = np.clip(q, chain.lower, chain.upper)
     q_rest = np.zeros(n) if q_rest is None else np.asarray(q_rest, dtype=float)
     p_target = np.asarray(p_target, dtype=float)
@@ -200,6 +204,7 @@ def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
     it = 0
     for it in range(1, max_iters + 1):
         T, J = chain.jacobian(q)
+        J[:, ~free] = 0.0  # locked joints contribute nothing
         Jp, Jw = J[:3], J[3:]
         ep = p_target - T[:3, 3]
         Jp_pinv = _dls(Jp, damping)
@@ -211,6 +216,7 @@ def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
             dq += N @ (_dls(JwN, damping) @ (ew - Jw @ dq))
         else:
             dq += N @ (posture_gain * (q_rest - q))
+        dq[~free] = 0.0
         step = np.max(np.abs(dq))
         if step > max_step:
             dq *= max_step / step
@@ -237,6 +243,54 @@ def solve_ik_restarts(chain, p_target, R_target=None, q0=None, restarts=8,
         if (r.pos_err, r.rot_err) < (best.pos_err, best.rot_err):
             best = r
     return best
+
+
+PITCH_STEPS = [math.radians(d) for d in (10, -10, 20, -20, 30, -30, 45, -45, 60, -60)]
+
+
+def solve_relaxed_pitch(chain, p_target, roll, pitch, yaw, home_R, q0, tol, **kw):
+    """Target pose unreachable: try the nearest reachable pitch instead, solving
+    from q0 (the current pose) so the result stays on the current branch.
+    Returns (IKResult, pitch used) or (None, None)."""
+    for dp in PITCH_STEPS:
+        R = rpy_to_matrix(roll, pitch + dp, yaw) @ home_R
+        res = solve_ik(chain, p_target, R, q0=q0, max_iters=50, **kw)
+        if res.pos_err <= tol:
+            return res, pitch + dp
+    return None, None
+
+
+class BranchGuard:
+    """Hold off sudden joint-space jumps (IK branch flips, glitchy inputs).
+
+    A solution within jump (rad, every joint) of the last accepted one passes.
+    A bigger jump passes only after `confirm` consecutive solutions agree with
+    each other (within agree rad): a real move persists, a flip back and forth
+    or a one-frame glitch doesn't. Call reset() after a hold/re-anchor if needed.
+    """
+
+    def __init__(self, jump=math.radians(30), confirm=3, agree=math.radians(10)):
+        self.jump, self.confirm, self.agree = jump, confirm, agree
+        self.pending, self.n = None, 0
+
+    def reset(self):
+        self.pending, self.n = None, 0
+
+    def __call__(self, q_last, q_new):
+        """True if q_new may be published (q_last = last published, or None)."""
+        q_new = np.asarray(q_new, dtype=float)
+        if q_last is None or np.max(np.abs(q_new - q_last)) <= self.jump:
+            self.reset()
+            return True
+        if self.pending is not None and np.max(np.abs(q_new - self.pending)) <= self.agree:
+            self.n += 1
+        else:
+            self.n = 1
+        self.pending = q_new
+        if self.n >= self.confirm:
+            self.reset()
+            return True
+        return False
 
 
 # ---------------------------------------------------------------- self-test

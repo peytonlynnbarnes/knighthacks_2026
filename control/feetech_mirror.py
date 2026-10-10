@@ -36,8 +36,11 @@ Safety:
       range; keeps wrist_roll off the 0/4095 seam).
     - No message for --stale-s on any joint: hold the current goal.
     - While following, the goal never leads the present position by more
-      than max(MIN_LEAD, LEAD_TIME * speed) ticks (like jog.py's MAX_LEAD),
-      so a joint slower than --max-speed just moves at its own pace.
+      than max(MIN_LEAD, LEAD_TIME * speed) ticks (like jog.py's MAX_LEAD).
+      All arm joints step together along a straight joint-space line at the
+      pace of the most constrained one (sync_step), so a joint slower than
+      --max-speed (shoulder_lift under load) slows the others instead of the
+      arm taking a dipping path.
     - Lag > max(MAX_LAG, LAG_TIME * speed) (only possible if a joint is
       pushed away or drops) or |load| > LOAD_ABORT: hold at present pose
       and exit.
@@ -148,6 +151,29 @@ def print_table(targets, present, limits, goals):
 
 def lag_limit(speed):
     return max(MAX_LAG, LAG_TIME * speed)
+
+
+def sync_step(goals, filt, present, max_step, lead):
+    """Advance every joint's goal toward filt along one straight joint-space
+    line, at the pace of the most constrained joint, so the joints arrive
+    together. Per joint the step is at most max_step and the goal may lead
+    present by at most `lead` (a joint lagging under load, e.g. shoulder_lift
+    lifting the arm, slows the others down instead of them running ahead,
+    which used to make the gripper dip on the way).
+    A joint already at its lead limit (sagging/blocked) doesn't set the pace:
+    it would stop the whole arm (deadlock). It just holds at present +- lead
+    and the others keep going. Returns new goals."""
+    scale = 1.0
+    for j, g in goals.items():
+        d = filt[j] - g
+        if abs(d) < 2:  # (nearly) there: don't let it hold the others back
+            continue
+        room = lead - math.copysign(1.0, d) * (g - present[j])  # advance left before leading by `lead`
+        if room <= 0:  # saturated: excluded from pacing (clamped below)
+            continue
+        scale = min(scale, min(max_step, room) / abs(d))
+    return {j: max(present[j] - lead, min(present[j] + lead, g + scale * (filt[j] - g)))
+            for j, g in goals.items()}
 
 
 def max_lead(speed):
@@ -309,15 +335,16 @@ def main():
                     lo, hi = limits.get(j, (0, 4095))
                     raw = max(lo, min(hi, sb.rad_to_ticks(j, targets[j])))
                     filt[j] = raw if j not in filt else filt[j] + args.alpha * (raw - filt[j])
-                    if torque:
-                        step = max(-max_step, min(max_step, filt[j] - goals[j]))
-                        g = goals[j] + step
-                        # never lead the joint by more than `lead` ticks: a slow
-                        # joint then moves at its own best speed instead of the goal
-                        # running away and tripping the lag abort
-                        g = max(present[j] - lead, min(present[j] + lead, g))
-                        goals[j] = max(lo, min(hi, g))
                 if torque:
+                    # all joints together, at the pace of the slowest/most lagging one
+                    # (goal never leads present by more than `lead`, so a slow joint
+                    # sets the pace instead of the goal running away and tripping the
+                    # lag abort)
+                    goals.update(sync_step({j: goals[j] for j in ARM_JOINTS}, filt, present,
+                                           max_step, lead))
+                    for j in ARM_JOINTS:
+                        lo, hi = limits.get(j, (0, 4095))
+                        goals[j] = max(lo, min(hi, goals[j]))
                     bus.send_goals({sids[j]: goals[j] for j in ARM_JOINTS})
 
             grip = node.fresh_grip() if gsid is not None else None

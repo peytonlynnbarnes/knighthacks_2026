@@ -111,9 +111,9 @@ class StereoCam:
 
 
 class Landmarker:
-    """MediaPipe HandLandmarker (Tasks API, VIDEO mode), one hand."""
+    """MediaPipe HandLandmarker (Tasks API, VIDEO mode), up to num_hands hands."""
 
-    def __init__(self, min_conf=0.5):
+    def __init__(self, min_conf=0.5, num_hands=1):
         from mediapipe.tasks.python import vision
         from mediapipe.tasks.python.core.base_options import BaseOptions
         if not os.path.exists(MODEL_PATH):
@@ -121,23 +121,33 @@ class Landmarker:
                                     f"  curl -L -o {MODEL_PATH} {MODEL_URL}")
         opts = vision.HandLandmarkerOptions(
             base_options=BaseOptions(model_asset_path=MODEL_PATH),
-            running_mode=vision.RunningMode.VIDEO, num_hands=1,
+            running_mode=vision.RunningMode.VIDEO, num_hands=num_hands,
             min_hand_detection_confidence=min_conf, min_hand_presence_confidence=min_conf,
             min_tracking_confidence=min_conf)
         self.lm = vision.HandLandmarker.create_from_options(opts)
         self.last_ms = -1
 
-    def detect(self, frame_bgr, t):
-        """(21,2) landmark pixels or None."""
+    def _run(self, frame_bgr, t):
         import mediapipe as mp
         ms = max(int(t * 1000), self.last_ms + 1)  # VIDEO mode needs increasing stamps
         self.last_ms = ms
         rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-        res = self.lm.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ms)
+        return self.lm.detect_for_video(mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb), ms)
+
+    def detect(self, frame_bgr, t):
+        """(21,2) landmark pixels of the first hand, or None."""
+        res = self._run(frame_bgr, t)
         if not res.hand_landmarks:
             return None
         h, w = frame_bgr.shape[:2]
         return np.array([[p.x * w, p.y * h] for p in res.hand_landmarks[0]])
+
+    def detect_all(self, frame_bgr, t):
+        """[(px (21,2), MediaPipe handedness label "Left"/"Right", score), ...]."""
+        res = self._run(frame_bgr, t)
+        h, w = frame_bgr.shape[:2]
+        return [(np.array([[p.x * w, p.y * h] for p in lm]), hd[0].category_name, hd[0].score)
+                for lm, hd in zip(res.hand_landmarks, res.handedness)]
 
     def close(self):
         self.lm.close()
@@ -146,13 +156,19 @@ class Landmarker:
 class StereoLandmarks:
     """One Landmarker per camera, run in parallel."""
 
-    def __init__(self, min_conf=0.5):
-        self.lms = (Landmarker(min_conf), Landmarker(min_conf))
+    def __init__(self, min_conf=0.5, num_hands=1):
+        self.lms = (Landmarker(min_conf, num_hands), Landmarker(min_conf, num_hands))
         self.pool = ThreadPoolExecutor(2)
 
     def __call__(self, f0, f1, t):
         a = self.pool.submit(self.lms[0].detect, f0, t)
         b = self.pool.submit(self.lms[1].detect, f1, t)
+        return a.result(), b.result()
+
+    def all(self, f0, f1, t):
+        """Per camera, every detected hand: see Landmarker.detect_all."""
+        a = self.pool.submit(self.lms[0].detect_all, f0, t)
+        b = self.pool.submit(self.lms[1].detect_all, f1, t)
         return a.result(), b.result()
 
     def close(self):
