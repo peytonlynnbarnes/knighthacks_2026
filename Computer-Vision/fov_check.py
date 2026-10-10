@@ -24,8 +24,9 @@ def main():
     ap.add_argument("--cam", type=int, default=0, help="V4L2 index (cam0 = 0, cam1 = 2)")
     ap.add_argument("--square-mm", type=float, required=True)
     ap.add_argument("--dist-cm", type=float, required=True, help="lens to board distance")
+    ap.add_argument("--size", type=int, nargs=2, default=[640, 480], metavar=("W", "H"))
     args = ap.parse_args()
-    cam = Camera(args.cam)
+    cam = Camera(args.cam, *args.size)
     W = cam.size[0]
     seq = 0
     try:

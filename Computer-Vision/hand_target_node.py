@@ -3,13 +3,20 @@
 plus /gripper (0 open .. 1 closed) from how far the fingers are curled.
 
 Pipeline (see ~/kh/INTEGRATION.md for the /ball_position contract):
-    2 cameras -> MediaPipe landmarks per view -> triangulate (calib/stereo.npz)
-    -> validate (reprojection, palm bone lengths) -> hand frame
+    2 cameras (resolution and focus from calib/stereo.npz, auto exposure and
+    white balance) -> pair nearest frames -> MediaPipe
+    landmarks per view -> cam1 landmarks moved to cam0's time
+    -> triangulate -> drop single bad landmarks, validate (reprojection,
+    palm bone lengths, template fit; one bad palm point is tolerated) -> hand frame
     -> relative to the calibrated neutral hand -> robot axes, x scale
-    -> one-euro filter, offset box clamp, speed limit -> /ball_position
+    -> position filter (cam frame, depth smoothed harder: still/moving Kalman
+    pair by default, --pos-filter kalman / euro for one model / the old
+    one-euro), offset box clamp, speed limit -> /ball_position
 
-Startup: a ~10 s hand calibration (hand_calib.py; instructions in the
-window), unless --reuse-calib. Needs calib/stereo.npz from stereo_calib.py.
+Startup: a ~30 s hand calibration (hand_calib.py; instructions in the
+window; ~10 s with --no-range-calib, which skips the roll/tilt range steps), every run: wherever the hand is held then becomes the origin, so
+control is consistent from session to session. Needs calib/stereo.npz from
+stereo_calib.py.
 
 Run (venv python + ROS on PYTHONPATH, like feetech_mirror.py):
     source /opt/ros/jazzy/setup.bash
@@ -19,37 +26,72 @@ Run (venv python + ROS on PYTHONPATH, like feetech_mirror.py):
     ros2 launch so101_mirror sim.launch.py ball_source:=false   (or ros2 run so101_mirror ik_node.py)
 
 Controls:
-    neutral hand -> arm at --neutral-offset (default 10 cm back, 5 cm down from
-    home, the middle of the reachable box). Hand motion x --scale (1.1).
-    Close the hand = close the gripper (proportional: open hand = open,
-    fist = closed). Tune with --grip-open-curl / --grip-closed-curl (the
-    printout shows the current curl).
+    calibration hand = origin: arm at home (the mid-workspace pose, see
+    INTEGRATION.md; --neutral-offset shifts it) with the gripper level (rpy 0).
+    Hand motion from there moves the arm 1:1 (--scale 1.0). Orientation is
+    amplified so a hand turn that stays trackable (palm not edge-on to the
+    cameras) covers the gripper's range: pitch -85 (up) .. +85 (down), roll
+    one way only, 0 .. +90 (a clockwise quarter turn of the hand; turning the
+    other way stays at 0). The gains come from the calibration's range steps
+    (roll clockwise 90 deg, tilt each way as far as it tracks: 85% of that
+    reaches the gripper's limit, gains 0.7..3); a direction it didn't measure
+    uses ROLL_GAIN / PITCH_GAIN, and --roll-gain / --pitch-gain override. A 3 deg soft deadband (--rot-deadband) keeps a still
+    hand level; the rotation is filtered before the gain (--rot-filter) and
+    held while the palm is edge-on. The status line shows hand vs gripper
+    angles and the palm's angle to the cameras.
+    Close the hand = close the gripper (proportional: flat open hand = fully
+    open, fist = closed). "Fully open" is the flat-hand curl measured in the
+    calibration's neutral step (x GRIP_OPEN_MARGIN, so a flat hand reliably
+    reaches 0); override with --grip-open-curl. --grip-closed-curl sets the
+    fist end (the printout shows the current curl).
     Hide the hand = clutch: nothing is published, the arm and gripper hold
     (IK after 0.5 s). When the hand comes back after >= --reanchor-s it
-    re-anchors: the arm continues from where it is, no jump. Shorter
+    re-anchors the position: the arm continues from where it is, no jump.
+    Orientation is not re-anchored (it would drift with every clutch): it
+    always follows the hand relative to the calibration pose, so a hand that
+    comes back turned rotates the gripper back at --max-ang. Shorter
     dropouts (bad frames) don't re-anchor.
     Keys: q/Esc quit, c recalibrate the hand.
 
+Filter testing (Phase 0, see filter_eval.py):
+    --record rec.npz   save the raw landmarks + capture times of every frame
+                       (start recording from launch: replay redoes the hand
+                       calibration from the recorded frames)
+    --replay rec.npz   no cameras / MediaPipe: run the recording through the
+                       same estimator + mapper (pass the same --frame /
+                       --no-range-calib). With --no-ros it runs as fast as it
+                       can; publishing, it plays back in real time.
+    --log out.npz      per frame: hand pose, unfiltered target, published
+                       target, grip (live or replayed) -> filter_eval.py
+
 Safety: the target starts at home (all zeros, where feetech_mirror --live
 homes) and moves at most --max-lin m/s and --max-ang deg/s, then the IK
-(EMA, workspace box) and feetech_mirror (rate limit, clamps) still apply.
+(interpolation, workspace box) and feetech_mirror (rate limit, clamps) still apply.
 """
 import argparse
+import json
 import math
-import os
+import sys
 import time
+from collections import deque
 
 import cv2
 import numpy as np
 
 import hand3d as h3
-from hand_calib import HAND_PATH, HandCalibrator, load_hand, save_hand
-from hand_mapping import HandMapper
-from stereo_cam import RIG_PATH, StereoCam, StereoLandmarks, draw_hand, load_rig
+from hand_calib import HAND_PATH, HandCalibrator, save_hand
+from hand_mapping import (BOX_MIN, IMM_PRESETS, HandMapper, RotationShaper, StereoIMM,
+                          StereoKalman, StillHold, gains_from_range)
+from stereo_cam import (RIG_PATH, StereoCam, StereoLandmarks, draw_hand, fit_view, load_rig,
+                        rig_focus)
 
 BALL_TOPIC = "/ball_position"  # must match so101_mirror.BALL_TOPIC
 GRIP_TOPIC = "/gripper"        # std_msgs/Float64, 0 = open .. 1 = closed (feetech_mirror --gripper)
-GRIP_ALPHA = 0.5               # EMA on the grip value, per frame
+GRIP_TAU = 0.04                # s, time constant of the grip smoothing (was 0.5 per frame ~ 25 fps)
+ROLL_GAIN = (1.5, 1.5)         # (neg, pos) when the range calibration didn't measure the roll
+PITCH_GAIN = (1.0, 2.0)        # (up, down) likewise
+GRIP_OPEN_CURL = 1.35          # fully-open curl when the hand calibration has none
+GRIP_OPEN_MARGIN = 0.9         # calibrated flat-hand curl x this = fully open
 
 
 class Publisher:
@@ -79,6 +121,126 @@ class Publisher:
             self.rclpy.try_shutdown()
 
 
+class Jitter:
+    """Raw (pre-filter) pose spread over the last window_s: position RMS (mm) and
+    rotation RMS (deg) about the window mean. Hold the hand still to read noise."""
+
+    def __init__(self, window_s=2.0):
+        self.window_s, self.buf = window_s, deque()
+
+    def add(self, t, p, R):
+        self.buf.append((t, p, R))
+        while t - self.buf[0][0] > self.window_s:
+            self.buf.popleft()
+
+    def clear(self):
+        self.buf.clear()
+
+    def read(self):
+        """(pos mm, rot deg), or None until the window is mostly full."""
+        if len(self.buf) < 5 or self.buf[-1][0] - self.buf[0][0] < 0.8 * self.window_s:
+            return None
+        ps = np.array([b[1] for b in self.buf])
+        Rm = h3.project_to_so3(np.mean([b[2] for b in self.buf], axis=0))
+        pos = np.sqrt(np.mean(np.sum((ps - ps.mean(axis=0)) ** 2, axis=1)))
+        rot = np.sqrt(np.mean([h3.rotation_angle(b[2] @ Rm.T) ** 2 for b in self.buf]))
+        return pos * 1000, math.degrees(rot)
+
+
+NAN_PX = np.full((21, 2), np.nan)
+
+
+class ReplayEnd(Exception):
+    pass
+
+
+class Replay:
+    """A --record file in place of StereoCam + StereoLandmarks: pair() and
+    __call__() hand back the recorded capture times and landmark pixels."""
+
+    def __init__(self, path, realtime):
+        z = np.load(path)
+        self.t, self.t0s, self.t1s = z["t"], z["t0"], z["t1"]
+        self.px0, self.px1 = z["px0"], z["px1"]
+        self.recal = set(int(i) for i in z["recal"])
+        self.argv = str(z["argv"])
+        self.realtime, self.i, self.start = realtime, -1, None
+        self.t0 = self.t1 = 0.0
+
+    def pair(self):
+        self.i += 1
+        if self.i >= len(self.t):
+            raise ReplayEnd
+        t = float(self.t[self.i])
+        if self.realtime:
+            if self.start is None:
+                self.start = time.monotonic() - t
+            time.sleep(max(0.0, self.start + t - time.monotonic()))
+        self.t0, self.t1 = float(self.t0s[self.i]), float(self.t1s[self.i])
+        return None, None, t
+
+    def __call__(self, f0, f1, t):
+        px = lambda a: None if np.isnan(a[0, 0]) else a.copy()  # noqa: E731
+        return px(self.px0[self.i]), px(self.px1[self.i])
+
+    def recalibrate_now(self):
+        return self.i in self.recal
+
+    def close(self):
+        pass
+
+
+class Recorder:
+    """--record: raw landmarks + capture times per frame, plus when 'c' was pressed."""
+
+    def __init__(self, path):
+        self.path, self.rows, self.recal = path, [], []
+
+    def add(self, t, t0, t1, px0, px1):
+        self.rows.append((t, t0, t1, NAN_PX if px0 is None else px0, NAN_PX if px1 is None else px1))
+
+    def mark_recal(self):
+        self.recal.append(len(self.rows) - 1)
+
+    def save(self):
+        if not self.rows:
+            return
+        t, t0, t1, px0, px1 = (np.array(c, dtype=float) for c in zip(*self.rows))
+        np.savez_compressed(self.path, t=t, t0=t0, t1=t1, px0=px0, px1=px1,
+                            recal=np.array(self.recal, dtype=int), argv=" ".join(sys.argv[1:]))
+        print(f"recorded {len(t)} frames ({t[-1] - t[0]:.0f} s) -> {self.path}")
+
+
+class FrameLog:
+    """--log: per frame t, state (0 calibrating, 1 tracking, 2 no hand), hand p (cam),
+    hand rpy (cam), unfiltered target, published target (NaN if none), grip,
+    reprojection error (px, NaN in mono) and mono (1 = single-camera pose)."""
+
+    def __init__(self, path, args):
+        self.path, self.rows, self.args = path, [], vars(args)
+
+    def add(self, t, state, pose=None, raw=None, out=None, grip=None):
+        nan3, nan6 = [np.nan] * 3, [np.nan] * 6
+        self.rows.append([t, state]
+                         + (list(pose["p"]) if pose is not None else nan3)
+                         + (list(h3.matrix_to_rpy(pose["R"])) if pose is not None else nan3)
+                         + (list(raw) if raw is not None else nan6)
+                         + (list(out) if out is not None else nan6)
+                         + [np.nan if grip is None else grip]
+                         + ([pose.get("err", np.nan), float(pose["mode"] != "stereo")]
+                            if pose is not None else [np.nan, np.nan]))
+
+    def save(self):
+        if not self.rows:
+            return
+        a = np.array(self.rows, dtype=float)
+        np.savez_compressed(self.path, t=a[:, 0], state=a[:, 1], hand_p=a[:, 2:5],
+                            hand_rpy=a[:, 5:8], raw=a[:, 8:14], out=a[:, 14:20], grip=a[:, 20],
+                            err=a[:, 21], mono=a[:, 22],
+                            args=json.dumps(self.args, default=str))
+        print(f"logged {len(a)} frames -> {self.path}")
+
+
 def draw_axes(img, pose, K, d, scale=0.05):
     """Hand frame axes (x red, y green, z blue) projected into cam0."""
     o = pose["p"]
@@ -97,85 +259,204 @@ def main():
     ap.add_argument("--cams", type=int, nargs=2, default=[0, 2])
     ap.add_argument("--rig", default=RIG_PATH)
     ap.add_argument("--no-ros", action="store_true", help="don't publish, just print")
-    ap.add_argument("--reuse-calib", action="store_true", help=f"load {HAND_PATH} instead of calibrating")
-    ap.add_argument("--scale", type=float, default=1.1, help="arm m per hand m")
-    ap.add_argument("--rot-scale", type=float, default=1.0, help="arm rad per hand rad")
+    ap.add_argument("--scale", type=float, default=1.0, help="arm m per hand m")
+    ap.add_argument("--rot-scale", type=float, default=1.0,
+                    help="multiplies all the rotation gains below")
+    ap.add_argument("--roll-gain", type=float, nargs=2, default=None, metavar=("NEG", "POS"),
+                    help="gripper roll per hand roll (about the forward axis), each direction; "
+                         "gripper roll is 0..+90, so negative gains make -hand roll the "
+                         "clockwise one (default: from the range calibration)")
+    ap.add_argument("--pitch-gain", type=float, nargs=2, default=None, metavar=("UP", "DOWN"),
+                    help="gripper pitch per hand pitch, tilting up / down (default: from the "
+                         "range calibration)")
+    ap.add_argument("--no-range-calib", action="store_true",
+                    help="skip the roll/tilt range steps of the calibration (default gains)")
+    ap.add_argument("--yaw-gain", type=float, default=1.0,
+                    help="yaw (the IK replaces it with the pan direction by default)")
+    ap.add_argument("--rot-deadband", type=float, default=3.0,
+                    help="soft deadband around the neutral hand (deg)")
+    ap.add_argument("--rot-filter", type=float, nargs=3, default=[0.3, 1.0, 0.3],
+                    metavar=("MIN_HZ", "BETA", "D_HZ"),
+                    help="one-euro filter on the hand rotation: cutoff when still, increase "
+                         "per rad/s, speed-estimate cutoff (lower = smoother, laggier)")
     ap.add_argument("--no-orientation", action="store_true", help="send roll/pitch/yaw = 0")
-    ap.add_argument("--neutral-offset", type=float, nargs=3, default=[-0.10, 0.0, -0.05],
+    ap.add_argument("--neutral-offset", type=float, nargs=3, default=[0.0, 0.0, 0.0],
                     help="arm offset from home for the neutral hand (m)")
+    ap.add_argument("--z-min", type=float, default=float(BOX_MIN[2]),
+                    help="lowest arm offset below home (m); the table guard. Lower it in "
+                         "small steps (home is 17.6 cm above base_link)")
     ap.add_argument("--max-lin", type=float, default=0.25, help="target speed limit (m/s)")
-    ap.add_argument("--max-ang", type=float, default=120.0, help="target speed limit (deg/s)")
-    ap.add_argument("--reproj-px", type=float, default=15.0, help="reject frames above this")
+    ap.add_argument("--max-ang", type=float, default=360.0,
+                    help="target rotation speed limit (deg/s, gripper; gains make it turn faster "
+                         "than the hand)")
+    ap.add_argument("--reproj-px", type=float, default=15.0,
+                    help="drop landmarks whose reprojection error is above this (px)")
+    ap.add_argument("--exposure", default="auto",
+                    help="'auto' (default), 'match' (fixed exposure for a set brightness, both "
+                         "cameras alike; needs a bright room) or a value in 100 us units")
+    ap.add_argument("--focus", type=int, default=None,
+                    help="locked focus 0..1023 (default: the one the rig was calibrated at, "
+                         "else autofocus)")
+    ap.add_argument("--no-skew-correct", action="store_true",
+                    help="don't move cam1's landmarks to cam0's capture time")
+    ap.add_argument("--frame", choices=["fit", "3pt"], default="fit",
+                    help="hand rotation: fit = least-squares fit of the 5-point palm template "
+                         "(needs a calibration made with it), 3pt = old wrist/index/pinky frame")
+    ap.add_argument("--fit-mm", type=float, default=15.0,
+                    help="reject frames whose palm fits the template worse than this (RMS mm)")
+    ap.add_argument("--jump-deg", type=float, default=45.0,
+                    help="hold back hand rotations jumping more than this until 3 frames agree "
+                         "(0 = off)")
     ap.add_argument("--mono-fallback", action="store_true",
                     help="track the palm from one camera when the other loses the hand")
     ap.add_argument("--no-view", action="store_true", help="no preview window")
-    ap.add_argument("--grip-open-curl", type=float, default=1.35,
-                    help="finger curl (palm lengths) that counts as fully open")
+    ap.add_argument("--grip-open-curl", type=float, default=None,
+                    help="finger curl (palm lengths) that counts as fully open "
+                         f"(default: from the hand calibration's flat hand, else {GRIP_OPEN_CURL})")
     ap.add_argument("--grip-closed-curl", type=float, default=0.85,
                     help="finger curl that counts as fully closed (fist)")
+    ap.add_argument("--pos-filter", choices=["imm", "kalman", "euro"], default="imm",
+                    help="position filter: still/moving model pair (hand_mapping.StereoIMM), a single "
+                         "stereo-aware Kalman (StereoKalman, --kf-*) or the old one-euro (--euro-pos)")
+    ap.add_argument("--imm", choices=sorted(IMM_PRESETS), default="smooth",
+                    help="IMM setting: smooth (default) or responsive (about half the tracking error "
+                         "and overshoot, less lag, ~35%% rougher while moving)")
+    ap.add_argument("--kf-q", type=float, default=0.001,
+                    help="Kalman process noise (m^2/s^3): higher = less lag, less smoothing")
+    ap.add_argument("--kf-sigma-px", type=float, default=4.0,
+                    help="Kalman landmark noise (px): higher = smoother, more lag and overshoot "
+                         "(a still hand measures ~0.35, moving hands are noisier; 3-6 is the useful range)")
+    ap.add_argument("--kf-gate", type=float, default=16.0,
+                    help="Kalman maneuver threshold (Mahalanobis^2): beyond it the filter catches up faster")
+    ap.add_argument("--euro-pos", type=float, nargs=2, default=[1.0, 2.0], metavar=("MIN_CUTOFF", "BETA"),
+                    help="one-euro position filter (--pos-filter euro): Hz, s/m")
+    ap.add_argument("--kf-vtau", type=float, default=0.0,
+                    help="Kalman velocity decay time constant (s, 0 = off): less overshoot on stops")
+    ap.add_argument("--lead", type=float, default=0.0,
+                    help="Kalman: predict this far ahead (s) to offset latency (0 = off)")
+    ap.add_argument("--still-hold", type=float, nargs="?", const=0.01, default=None, metavar="M_S",
+                    help="freeze the position while the hand is slower than M_S (default 0.01 m/s) "
+                         "for 0.15 s; releases past 5 mm or 3x the speed")
+    ap.add_argument("--record", metavar="NPZ", help="save raw landmarks for --replay")
+    ap.add_argument("--replay", metavar="NPZ", help="run a --record file instead of the cameras")
+    ap.add_argument("--log", metavar="NPZ", help="save per-frame targets for filter_eval.py")
     ap.add_argument("--reanchor-s", type=float, default=0.3,
                     help="hand hidden at least this long (s) -> re-anchor when it returns")
     args = ap.parse_args()
+    if args.replay:
+        args.no_view = True
 
     try:
         rig = load_rig(args.rig)
-        if args.reuse_calib:
-            load_hand()
     except FileNotFoundError as e:
-        raise SystemExit(f"missing {e.filename or e}" if args.reuse_calib and os.path.exists(args.rig)
-                         else str(e))
-    est = h3.StereoHand(rig, reproj_px=args.reproj_px, mono_fallback=args.mono_fallback)
-    print(f"stereo rig: {args.rig} ({rig['method']}), baseline "
+        raise SystemExit(str(e))
+    est = h3.StereoHand(rig, reproj_px=args.reproj_px, mono_fallback=args.mono_fallback,
+                        frame=args.frame, fit_mm=args.fit_mm, jump_deg=args.jump_deg)
+    size = tuple(int(v) for v in rig["size"])
+    focus = args.focus if args.focus is not None else rig_focus(rig)
+    print(f"stereo rig: {args.rig} ({rig['method']}), {size[0]}x{size[1]}, baseline "
           f"{np.linalg.norm(rig['t']) * 100:.1f} cm")
     calib, mapper = None, None
+    grip_open = GRIP_OPEN_CURL
 
     def start_tracking(res):
-        nonlocal mapper
+        nonlocal mapper, grip_open
         est.set_hand(res["bones"], res["template"])
+        if args.grip_open_curl is not None:
+            grip_open = args.grip_open_curl
+        elif res.get("open_curl") is not None:
+            grip_open = float(res["open_curl"]) * GRIP_OPEN_MARGIN
+        # keep a usable range even if the calibration hand wasn't really flat
+        grip_open = max(grip_open, args.grip_closed_curl + 0.15)
+        print(f"gripper: fully open at curl >= {grip_open:.2f}, closed at <= {args.grip_closed_curl:.2f}")
+        rng = {k: tuple(None if not np.isfinite(v) else float(v) for v in res.get(f"range_{k}", (np.nan,) * 2))
+               for k in ("roll", "pitch")}
+        cal = gains_from_range(rng)
+        gains = {}
+        for k, user, dflt in (("roll", args.roll_gain, ROLL_GAIN), ("pitch", args.pitch_gain, PITCH_GAIN)):
+            gains[k] = tuple(user[i] if user else (cal[k][i] if cal[k][i] is not None else dflt[i])
+                             for i in range(2))
+            src = "option" if user else ", ".join(
+                f"{'+-'[i == 0]}{rng[k][i]:.0f}deg" if rng[k][i] is not None else "default" for i in (0, 1))
+            print(f"{k} gain -/+ {gains[k][0]:.2f} / {gains[k][1]:.2f}  (hand range {src})")
         old = mapper
+        kalman = None
+        f_px, base_m = float(rig["K0"][0, 0]), float(np.linalg.norm(rig["t"]))
+        if args.pos_filter == "imm":
+            kalman = StereoIMM(f_px, base_m, **IMM_PRESETS[args.imm])
+        elif args.pos_filter == "kalman":
+            kalman = StereoKalman(f_px, base_m, sigma_px=args.kf_sigma_px, q=args.kf_q, gate=args.kf_gate,
+                                  v_tau=args.kf_vtau)
+        still = None if args.still_hold is None else StillHold(args.still_hold, 3 * args.still_hold)
         mapper = HandMapper(res["A"], res["neutral_p"], res["neutral_R"], scale=args.scale,
-                            rot_scale=args.rot_scale, neutral_offset=args.neutral_offset,
-                            max_lin_speed=args.max_lin, max_ang_speed=math.radians(args.max_ang))
+                            rot_filter=tuple(args.rot_filter),
+                            shaper=RotationShaper(gains["roll"], gains["pitch"], args.yaw_gain,
+                                                  math.radians(args.rot_deadband), scale=args.rot_scale),
+                            neutral_offset=args.neutral_offset,
+                            max_lin_speed=args.max_lin, max_ang_speed=math.radians(args.max_ang),
+                            box_min=np.array([BOX_MIN[0], BOX_MIN[1], args.z_min]),
+                            pos_filter=tuple(args.euro_pos),
+                            kalman=kalman, still_hold=still, lead_s=args.lead)
         if old is not None:  # recalibration: continue (speed-limited) from the current target
             mapper.cur_p, mapper.cur_R, mapper.cur_t = old.cur_p, old.cur_R, old.cur_t
 
-    if args.reuse_calib:
-        start_tracking(load_hand())
-        print(f"hand calibration loaded from {HAND_PATH}")
-    else:
-        calib = HandCalibrator()
+    calib = HandCalibrator(args.frame, not args.no_range_calib)  # every run: calibration hand = origin
 
     pub = Publisher(not args.no_ros)
-    cam = StereoCam(args.cams)
-    lms = StereoLandmarks()
-    lost_since, grip = None, None  # when the hand disappeared; filtered grip 0..1
+    rec = Recorder(args.record) if args.record else None
+    log = FrameLog(args.log, args) if args.log else None
+    if args.replay:
+        cam = lms = Replay(args.replay, realtime=not args.no_ros)
+        print(f"replaying {args.replay} ({len(cam.t)} frames); recorded with: {cam.argv or '(defaults)'}")
+    else:
+        cam = StereoCam(args.cams, size=size)  # the intrinsics only hold at the calibrated size
+        exposure = {"match": "match", "auto": None}.get(args.exposure, args.exposure)
+        print("cameras:", cam.configure(float(exposure) if exposure not in ("match", None) else exposure,
+                                        focus=focus))
+        if focus is None:
+            print("  autofocus: the focal length may drift from the calibration; calibrate with "
+                  "stereo_calib.py --focus N to lock it")
+        lms = StereoLandmarks()
+    skew = None if args.no_skew_correct else h3.SkewCorrector()
+    lost_since, grip, grip_t = None, None, None  # when the hand disappeared; filtered grip 0..1
     last_print, fps_n, fps_t, fps = 0.0, 0, time.monotonic(), 0.0
     target, why = None, ""
+    jitter = Jitter()
     try:
         while True:
             pr = cam.pair()
             if pr is None:
                 continue
             f0, f1, t = pr
-            px0, px1 = lms(f0, f1, t)
-            pose, why = est.estimate(px0, px1)
+            px0, px1_raw = lms(f0, f1, t)
+            if rec is not None:
+                rec.add(t, cam.t0, cam.t1, px0, px1_raw)
+            px1 = px1_raw if skew is None else skew(px1_raw, cam.t1, cam.t0)
+            pose, why = est.estimate(px0, px1, t)
             status = ""
             published = False
 
             if calib is not None:
                 if calib.feed(pose, t):
-                    save_hand(calib.result)
-                    print(f"hand calibrated ({calib.msg}); saved {HAND_PATH}")
+                    if args.replay:  # don't overwrite the live calibration
+                        print(f"hand calibrated ({calib.msg})")
+                    else:
+                        save_hand(calib.result)
+                        print(f"hand calibrated ({calib.msg}); saved {HAND_PATH}")
                     start_tracking(calib.result)
                     calib = None
                     lost_since = None
                 else:
                     status = calib.instructions()
+                if log is not None:
+                    log.add(t, 0, pose)
             elif pose is not None:
                 if lost_since is not None and t - lost_since >= args.reanchor_s:
                     mapper.reanchor(pose["p"], pose["R"])  # clutch release: no jump
                 lost_since = None
-                target = mapper.update(pose["p"], pose["R"], t)
+                jitter.add(t, pose["p"], pose["R"])
+                raw_p, raw_R = mapper.raw_target(pose["p"], pose["R"])
+                target = mapper.update(pose["p"], pose["R"], t, pose.get("err"), pose["mode"] != "stereo")
                 out = target.copy()
                 if args.no_orientation:
                     out[3:] = 0.0
@@ -183,14 +464,24 @@ def main():
                 published = True
                 status = f"TRACKING [{pose['mode']}]"
                 if pose["curl"] is not None:  # stereo only; mono -> gripper holds
-                    g = (args.grip_open_curl - pose["curl"]) / (args.grip_open_curl - args.grip_closed_curl)
+                    g = (grip_open - pose["curl"]) / (grip_open - args.grip_closed_curl)
                     g = min(1.0, max(0.0, g))
-                    grip = g if grip is None else grip + GRIP_ALPHA * (g - grip)
+                    if grip is None:
+                        grip = g
+                    else:  # time-based, so it smooths the same at any frame rate
+                        dt = min(max(0.0, t - grip_t), HandMapper.MAX_DT)
+                        grip += (1.0 - math.exp(-dt / GRIP_TAU)) * (g - grip)
+                    grip_t = t
                     pub.grip(grip)
                     status += f" grip {grip:.2f} (curl {pose['curl']:.2f})"
+                if log is not None:
+                    log.add(t, 1, pose, np.concatenate([raw_p, h3.matrix_to_rpy(raw_R)]), out, grip)
             else:
                 if lost_since is None:
                     lost_since = t
+                if log is not None:
+                    log.add(t, 2)
+                jitter.clear()
                 status = f"no hand (clutch: holding): {why}"
 
             if time.monotonic() - last_print > 0.5:
@@ -201,19 +492,27 @@ def main():
                     line += (f"  xyz cm {x * 100:+6.1f} {y * 100:+6.1f} {z * 100:+6.1f}  "
                              f"rpy deg {math.degrees(r):+5.0f} {math.degrees(p):+5.0f} "
                              f"{math.degrees(yw):+5.0f}")
+                    hr = np.degrees(mapper.hand_rpy)
+                    line += (f"  hand {hr[0]:+4.0f} {hr[1]:+4.0f} {hr[2]:+4.0f}"
+                             f"  palm {mapper.palm_angle:2.0f}deg{'' if mapper.trust > 0 else ' HELD'}")
+                    jit = jitter.read()
+                    if jit is not None:
+                        line += f"  jitter {jit[0]:4.1f} mm {jit[1]:4.1f} deg"
                 print(line, flush=True)
 
+            if args.replay and cam.recalibrate_now():
+                calib, target = HandCalibrator(args.frame, not args.no_range_calib), None
             fps_n += 1
             if time.monotonic() - fps_t > 1.0:
                 fps, fps_n, fps_t = fps_n / (time.monotonic() - fps_t), 0, time.monotonic()
             if args.no_view:
                 continue
             draw_hand(f0, px0)
-            draw_hand(f1, px1)
+            draw_hand(f1, px1_raw)
             if pose is not None:
                 draw_axes(f0, pose, rig["K0"], rig["d0"])
             view = np.hstack([f0, f1])
-            lines = [status, f"{fps:.0f} fps"]
+            lines = [status, f"{fps:.0f} fps, skew {(cam.t1 - cam.t0) * 1000:+.0f} ms"]
             if target is not None and calib is None:
                 x, y, z, r, p, yw = target
                 lines.append(f"offset cm x{x * 100:+.1f} y{y * 100:+.1f} z{z * 100:+.1f}  "
@@ -222,15 +521,21 @@ def main():
             for i, s in enumerate(lines):
                 cv2.putText(view, s, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                             (0, 0, 255) if pose is None else (0, 255, 255), 2)
-            cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", view)
+            cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", fit_view(view))
             k = cv2.waitKey(1) & 0xFF
             if k in (ord("q"), 27):
                 break
             if k == ord("c"):
-                calib, target = HandCalibrator(), None  # stops publishing until done
-    except KeyboardInterrupt:
+                calib, target = HandCalibrator(args.frame, not args.no_range_calib), None  # stops publishing
+                if rec is not None:
+                    rec.mark_recal()
+    except (KeyboardInterrupt, ReplayEnd):
         pass
     finally:
+        if rec is not None:
+            rec.save()
+        if log is not None:
+            log.save()
         lms.close()
         cam.close()
         pub.close()

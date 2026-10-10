@@ -298,6 +298,9 @@
     effort="10"
     velocity="10"/>
 
+  <!-- wrist_flex lower: -119 deg, the real servo's measured range (control/so101_bus.py
+       SOFT_LIMITS, 694 ticks) instead of the stock -95 deg, so the gripper can point up
+       (~-86 deg pitch at home instead of ~-31). Needs the JOINT_CAL sign verified on hardware. -->
   <xacro:revolute_joint
     name="wrist_flex"
     parent="lower_arm_link"
@@ -305,7 +308,7 @@
     xyz="-0.1349 0.0052 3.62355e-17"
     rpy="4.02456e-15 8.67362e-16 -1.5708"
     axis="0 0 1"
-    lower="-1.65806"
+    lower="-2.07694"
     upper="1.65806"
     effort="10"
     velocity="10"/>

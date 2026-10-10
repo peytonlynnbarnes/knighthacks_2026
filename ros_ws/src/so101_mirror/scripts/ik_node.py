@@ -2,8 +2,9 @@
 """IK node: /ball_position target -> SO-ARM101 joint angles on /arm/<joint>.
 
 Input:  /ball_position  std_msgs/Float64MultiArray [x, y, z, roll, pitch, yaw]
-        OFFSET FROM HOME. Home = the end-effector pose at the base pose (all
-        joints 0 rad = servo 2048, base_pose.py). [0,0,0,0,0,0] = stay home.
+        OFFSET FROM HOME. Home = the mid-workspace pose (so101_mirror.model:
+        joint-zero end-effector + HOME_OFFSET, 10 cm back, 5 cm down, gripper
+        level). [0,0,0,0,0,0] = stay home.
         xyz: meters along the base_link axes (+X forward, +Y left, +Z up).
         rpy: rotation (base_link axes, R = Rz Ry Rx) applied to the home
         gripper orientation. Target = (home_p + xyz, R(rpy) @ home_R).
@@ -14,12 +15,20 @@ The arm has 5 DOF: position is always solved first, orientation is best
 effort with the remaining DOF (in practice: approach pitch in the arm's
 vertical plane + roll about the approach axis; yaw is tied to position).
 
+Solving is so101_mirror.ik_solver.TargetSolver (pure, see its docstring):
+warm start from the last solution, limit-aware task-priority IK (position
+first, orientation best effort), deterministic reseeds and a time budget when
+the warm start misses, and a branch guard against sudden joint flips.
+
 Safety/robustness (the real arm follows this output):
-    - target EMA filter (alpha) and a workspace box reject NaN / wild targets
-    - warm start from the last solution; random restarts only if that fails
-    - unreachable (pos_err > max_pos_err) or stale targets: publish nothing,
-      so downstream holds the last good pose
-    - joint limits from the URDF
+    - targets are interpolated to the solve rate (so101_mirror.target_filter):
+      camera-rate targets arrive irregularly, and solving on the latest one
+      gave the arm uneven steps; a workspace box rejects NaN / wild targets
+    - unreachable (pos_err > max_pos_err), stale or branch-flipping targets:
+      publish nothing, so downstream holds the last good pose
+    - joint limits: URDF intersected with the real arm's soft limits
+      (control/so101_bus.py SOFT_LIMITS, which feetech_mirror clamps to), so
+      the IK never relies on a pose the arm will refuse
     The hardware node still rate-limits and clamps; this is not the last line.
 
 Usage:
@@ -34,7 +43,19 @@ Parameters:
                      own, and an unreachable yaw used to make the whole pose
                      fall back to position-only (gripper flips down)
     rot_weight       orientation task gain (0..1)
-    alpha            EMA factor on the target, 1 = no filtering
+    rot_damping      orientation task damping: higher = smoother where the
+                     target orientation is out of reach, less exact
+    jump_deg, jump_confirm  branch guard: a solution moving any joint more
+                     than jump_deg is published only once jump_confirm
+                     consecutive ticks agree
+    solve_budget_s   time for reseeding when the warm start misses
+    hw_limits_file   so101_bus.py to read SOFT_LIMITS from ('' = URDF only)
+    interp_delay     sample the target path this far behind real time (s),
+                     linearly between the targets around that moment; ~one
+                     normal gap between targets. 0 = latest target, as is
+    smooth_tau       extra time-based smoothing of the target (s), 0 = off
+                     (smoothing belongs in the CV node; this replaced the
+                     per-message EMA `alpha`, which smoothed more at higher fps)
     max_pos_err      reject solutions worse than this (m)
     rate             solve/publish rate (Hz)
     stale_s          stop publishing when no target for this long (s)
@@ -49,8 +70,10 @@ from rclpy.node import Node
 from std_msgs.msg import Float64, Float64MultiArray
 
 from so101_mirror import ARM_JOINTS, ARM_TOPIC_PREFIX, BALL_TOPIC
-from so101_mirror.kinematics import rpy_to_matrix, solve_ik, solve_ik_restarts
-from so101_mirror.model import default_urdf_path, home_pose, load_chain
+from so101_mirror.ik_solver import TargetSolver
+from so101_mirror.target_filter import TargetInterpolator
+from so101_mirror.model import (HW_LIMITS_FILE, apply_limits, default_urdf_path, hardware_limits,
+                                home_pose, load_chain)
 
 
 class IKNode(Node):
@@ -60,7 +83,13 @@ class IKNode(Node):
         self.declare_parameter("use_orientation", True)
         self.declare_parameter("free_yaw", True)
         self.declare_parameter("rot_weight", 0.5)
-        self.declare_parameter("alpha", 0.5)
+        self.declare_parameter("rot_damping", 0.1)
+        self.declare_parameter("jump_deg", 30.0)
+        self.declare_parameter("jump_confirm", 3)
+        self.declare_parameter("solve_budget_s", 0.02)
+        self.declare_parameter("hw_limits_file", HW_LIMITS_FILE)
+        self.declare_parameter("interp_delay", 0.04)
+        self.declare_parameter("smooth_tau", 0.0)
         self.declare_parameter("max_pos_err", 0.01)
         self.declare_parameter("rate", 30.0)
         self.declare_parameter("stale_s", 0.5)
@@ -72,13 +101,22 @@ class IKNode(Node):
         if tuple(self.chain.active) != ARM_JOINTS:
             raise RuntimeError(f"URDF chain joints {self.chain.active} != {ARM_JOINTS}")
         self.home_p, self.home_R = home_pose(self.chain)
-        _, frames = self.chain.fk(np.zeros(len(self.chain.active)), return_frames=True)
-        self.pan_xy = frames[0][0][:2]  # pan axis location in base_link
+        changed = apply_limits(self.chain, hardware_limits(gp("hw_limits_file")))
+        if changed:
+            self.get_logger().info("joint limits narrowed to the arm's soft limits: " + ", ".join(
+                f"{j} {math.degrees(lo):+.0f}..{math.degrees(hi):+.0f}" for j, (lo, hi) in changed.items()))
+        elif gp("hw_limits_file"):
+            self.get_logger().warn(f"no soft limits from {gp('hw_limits_file')!r}: URDF limits only")
+        self.solver = TargetSolver(
+            self.chain, self.home_p, self.home_R, use_orientation=gp("use_orientation"),
+            free_yaw=gp("free_yaw"), rot_weight=gp("rot_weight"), rot_damping=gp("rot_damping"),
+            max_pos_err=gp("max_pos_err"), jump_deg=gp("jump_deg"), confirm=gp("jump_confirm"),
+            budget_s=gp("solve_budget_s"))
         self.ws_min = np.array(gp("workspace_min"))
         self.ws_max = np.array(gp("workspace_max"))
 
-        self.q = np.zeros(len(ARM_JOINTS))  # warm start (zero = L-pose, all 2048)
-        self.target = None                   # filtered offset [x y z r p y]
+        self.interp = TargetInterpolator(delay=gp("interp_delay"), tau=gp("smooth_tau"))
+        self.target = None                   # latest accepted offset [x y z r p y]
         self.target_t = None
         self.pubs = {j: self.create_publisher(Float64, ARM_TOPIC_PREFIX + j, 10)
                      for j in ARM_JOINTS}
@@ -100,15 +138,13 @@ class IKNode(Node):
                                    "outside workspace box, ignored",
                                    throttle_duration_sec=2.0)
             return
-        a = self.get_parameter("alpha").value
-        if self.target is None:
-            self.target = d
-        else:
-            # EMA; angles are filtered through their wrapped difference
-            diff = d - self.target
-            diff[3:] = (diff[3:] + math.pi) % (2 * math.pi) - math.pi
-            self.target = self.target + a * diff
-        self.target_t = self.get_clock().now()
+        now = self.get_clock().now()
+        if self.target_t is not None and \
+                (now - self.target_t).nanoseconds * 1e-9 > self.get_parameter("stale_s").value:
+            self.interp.reset()  # don't interpolate across a long gap (stale) from an old target
+        self.target = d
+        self.target_t = now
+        self.interp.add(now.nanoseconds * 1e-9, d)
 
     def tick(self):
         if self.target is None:
@@ -117,49 +153,21 @@ class IKNode(Node):
         if age > self.get_parameter("stale_s").value:
             self.get_logger().warn(f"target stale ({age:.1f} s), holding", throttle_duration_sec=5.0)
             return
-        p = self.home_p + self.target[:3]
-        R = None
-        if self.get_parameter("use_orientation").value:
-            roll, pitch, yaw = self.target[3:]
-            if self.get_parameter("free_yaw").value:
-                yaw = math.atan2(p[1] - self.pan_xy[1], p[0] - self.pan_xy[0])
-            R = rpy_to_matrix(roll, pitch, yaw) @ self.home_R
-        kw = dict(rot_weight=self.get_parameter("rot_weight").value)
-        tol = self.get_parameter("max_pos_err").value
-
-        res = solve_ik(self.chain, p, R, q0=self.q, max_iters=50, **kw)
-        if res.pos_err > tol:  # warm start stuck: try fresh seeds
-            res = solve_ik_restarts(self.chain, p, R, q0=self.q, accept_tol=tol / 2, **kw)
-        if res.pos_err > tol and R is not None:
-            # pitch past the wrist's reach: back the pitch off toward level
-            # before dropping orientation (which can flip the gripper over)
-            for s in (0.75, 0.5, 0.25):
-                Rs = rpy_to_matrix(roll, s * pitch, yaw) @ self.home_R
-                r2 = solve_ik(self.chain, p, Rs, q0=self.q, max_iters=50, **kw)
-                if r2.pos_err <= tol:
-                    res = r2
-                    self.get_logger().warn(f"pitch {math.degrees(pitch):.0f} deg unreachable, "
-                                           f"using {math.degrees(s * pitch):.0f}",
-                                           throttle_duration_sec=2.0)
-                    break
-        if res.pos_err > tol and R is not None:
-            # orientation is best effort: give it up before giving up position
-            res = solve_ik_restarts(self.chain, p, None, q0=self.q, accept_tol=tol / 2)
-            if res.pos_err <= tol:
-                self.get_logger().warn("pose unreachable with orientation, using position only",
-                                       throttle_duration_sec=2.0)
-        if res.pos_err > tol:
-            self.get_logger().warn(f"unreachable target {np.round(p, 3)} "
-                                   f"(best err {res.pos_err * 1000:.0f} mm), holding",
+        target = self.interp.sample(self.get_clock().now().nanoseconds * 1e-9)
+        q = self.solver.solve(target)
+        info = self.solver.info
+        if q is None:
+            p = self.home_p + target[:3]
+            self.get_logger().warn(f"{info['how']}: target {np.round(p, 3)} "
+                                   f"(best err {info['pos_err'] * 1000:.0f} mm), holding",
                                    throttle_duration_sec=1.0)
             return
-
-        self.q = res.q
-        for j, v in zip(ARM_JOINTS, self.q):
+        for j, v in zip(ARM_JOINTS, q):
             self.pubs[j].publish(Float64(data=float(v)))
         self.get_logger().info(
-            "q(deg)=" + " ".join(f"{j}:{math.degrees(v):+.0f}" for j, v in zip(ARM_JOINTS, self.q))
-            + f"  pos_err={res.pos_err * 1000:.1f}mm rot_err={math.degrees(res.rot_err):.0f}deg",
+            "q(deg)=" + " ".join(f"{j}:{math.degrees(v):+.0f}" for j, v in zip(ARM_JOINTS, q))
+            + f"  pos_err={info['pos_err'] * 1000:.1f}mm rot_err={math.degrees(info['rot_err']):.0f}deg"
+            f" [{info['how']}, {info['ms']:.0f} ms]",
             throttle_duration_sec=2.0)
 
 

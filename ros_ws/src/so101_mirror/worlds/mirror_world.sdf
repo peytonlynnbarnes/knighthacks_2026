@@ -7,9 +7,9 @@
     - kinematic + no gravity + no collision: it stays wherever you put it and
       the arm can pass through it. Move/rotate it with the Gazebo GUI
       translate (T) / rotate (R) tools, or with ball_sweep.py.
-    - it spawns at HOME: the end-effector position of the base pose (all
-      joints 2048), so /ball_position starts at [0,0,0,0,0,0]. Keep this
-      pose equal to so101_mirror.model.home_pose() (FK at q = 0).
+    - it spawns at HOME: the mid-workspace pose (joint-zero end-effector
+      + HOME_OFFSET), so /ball_position starts at [0,0,0,0,0,0]. Keep this
+      pose equal to so101_mirror.model.home_pose().
     - the red arrow is the ball's +X axis, which at home is the gripper
       approach direction. Rotating the ball rotates the gripper from its home
       orientation. Green tick = +Y, so roll is visible too.
@@ -59,7 +59,7 @@
     </model>
 
     <model name="ball">
-      <pose>0.3914 0.0 0.2265 0 0 0</pose>
+      <pose>0.2914 0.0 0.1765 0 0 0</pose>
       <link name="link">
         <kinematic>true</kinematic>
         <gravity>false</gravity>

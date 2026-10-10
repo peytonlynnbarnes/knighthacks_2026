@@ -10,8 +10,10 @@ The gripper (ID 6) is only touched with --gripper: then /gripper
 linearly to so101_bus.GRIPPER_OPEN .. GRIPPER_CLOSED ticks.
 
 With --live the arm first eases to its base pose (every arm joint at 2048,
-like base_pose.py), which is IK home and /ball_position [0,0,0,0,0,0]. Only
-then does it start following /arm/*.
+like base_pose.py). Only then does it start following /arm/*. IK home
+(/ball_position [0,0,0,0,0,0]) is the mid-workspace pose 10 cm back and 5 cm
+down from there, so with the target at home the IK output moves the arm there
+(lift -51, elbow +64, wrist_flex -13 deg) right after homing, rate limited.
 
 Needs ROS sourced so the venv python can import rclpy:
     source /opt/ros/jazzy/setup.bash

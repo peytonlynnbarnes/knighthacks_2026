@@ -5,8 +5,8 @@ Input:  /sim/ball_pose  geometry_msgs/PoseStamped, world frame (bridged from
         gz /model/ball/pose by sim.launch.py)
 Output: /ball_position  std_msgs/Float64MultiArray
         data = [x, y, z, roll, pitch, yaw]  (meters, radians), OFFSET FROM HOME:
-        xyz = ball position minus the home end-effector position (base pose,
-        all joints 2048), along the base_link axes. rpy = the ball's rotation
+        xyz = ball position minus home (the mid-workspace pose,
+        so101_mirror.model.home_pose()), along the base_link axes. rpy = the ball's rotation
         (base_link axes, R = Rz(yaw) Ry(pitch) Rx(roll)); the ball spawns at
         home with rpy 0, so the first message is [0, 0, 0, 0, 0, 0].
 

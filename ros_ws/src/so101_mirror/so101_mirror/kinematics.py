@@ -187,8 +187,13 @@ def _dls(J, damping):
 
 def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
              max_iters=150, pos_tol=1e-4, damping=0.005, rot_weight=0.5,
-             posture_gain=0.1, max_step=0.2):
+             posture_gain=0.1, max_step=0.2, rot_damping=None):
     """Task-priority IK. R_target=None means position only.
+
+    rot_damping: damping of the orientation (secondary) task, default `damping`.
+    Larger values trade orientation accuracy for smoothness where the target
+    orientation is out of reach (the least-squares orientation is then badly
+    conditioned and the arm reshuffles quickly).
 
     Returns IKResult; it is the caller's job to reject large pos_err."""
     n = len(chain.active)
@@ -200,17 +205,28 @@ def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
     it = 0
     for it in range(1, max_iters + 1):
         T, J = chain.jacobian(q)
-        Jp, Jw = J[:3], J[3:]
         ep = p_target - T[:3, 3]
-        Jp_pinv = _dls(Jp, damping)
-        dq = Jp_pinv @ ep
-        N = I - Jp_pinv @ Jp
-        if R_target is not None:
-            ew = rot_weight * rotvec_error(R_target, T[:3, :3])
-            JwN = Jw @ N
-            dq += N @ (_dls(JwN, damping) @ (ew - Jw @ dq))
-        else:
-            dq += N @ (posture_gain * (q_rest - q))
+        ew = None if R_target is None else rot_weight * rotvec_error(R_target, T[:3, :3])
+        # Joint-limit clamping: a joint sitting at a limit that the step pushes
+        # further out is frozen (its column removed) and the step re-solved with
+        # the others. Plain clipping instead leaves the tasks fighting the limit,
+        # which stalls the solve and drives the random-restart branch flips.
+        free = np.ones(n, dtype=bool)
+        for _ in range(n):
+            Jf = J * free
+            Jp, Jw = Jf[:3], Jf[3:]
+            Jp_pinv = _dls(Jp, damping)
+            dq = Jp_pinv @ ep
+            N = (I - Jp_pinv @ Jp) * free
+            if ew is not None:
+                JwN = Jw @ N
+                dq += N @ (_dls(JwN, damping if rot_damping is None else rot_damping) @ (ew - Jw @ dq))
+            else:
+                dq += N @ (posture_gain * (q_rest - q))
+            stuck = free & (((q <= chain.lower + 1e-9) & (dq < 0)) | ((q >= chain.upper - 1e-9) & (dq > 0)))
+            if not stuck.any():
+                break
+            free &= ~stuck
         step = np.max(np.abs(dq))
         if step > max_step:
             dq *= max_step / step
