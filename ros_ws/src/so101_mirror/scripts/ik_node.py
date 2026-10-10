@@ -29,6 +29,10 @@ Usage:
 Parameters:
     urdf_path        xacro/urdf file (default: installed so101.urdf.xacro)
     use_orientation  track ball rpy (true) or position only (false)
+    free_yaw         ignore the target yaw and use the yaw the pan joint gives
+                     at that position (true): a 5-DOF arm can't set yaw on its
+                     own, and an unreachable yaw used to make the whole pose
+                     fall back to position-only (gripper flips down)
     rot_weight       orientation task gain (0..1)
     alpha            EMA factor on the target, 1 = no filtering
     max_pos_err      reject solutions worse than this (m)
@@ -54,6 +58,7 @@ class IKNode(Node):
         super().__init__("ik_node")
         self.declare_parameter("urdf_path", default_urdf_path())
         self.declare_parameter("use_orientation", True)
+        self.declare_parameter("free_yaw", True)
         self.declare_parameter("rot_weight", 0.5)
         self.declare_parameter("alpha", 0.5)
         self.declare_parameter("max_pos_err", 0.01)
@@ -67,6 +72,8 @@ class IKNode(Node):
         if tuple(self.chain.active) != ARM_JOINTS:
             raise RuntimeError(f"URDF chain joints {self.chain.active} != {ARM_JOINTS}")
         self.home_p, self.home_R = home_pose(self.chain)
+        _, frames = self.chain.fk(np.zeros(len(self.chain.active)), return_frames=True)
+        self.pan_xy = frames[0][0][:2]  # pan axis location in base_link
         self.ws_min = np.array(gp("workspace_min"))
         self.ws_max = np.array(gp("workspace_max"))
 
@@ -113,13 +120,28 @@ class IKNode(Node):
         p = self.home_p + self.target[:3]
         R = None
         if self.get_parameter("use_orientation").value:
-            R = rpy_to_matrix(*self.target[3:]) @ self.home_R
+            roll, pitch, yaw = self.target[3:]
+            if self.get_parameter("free_yaw").value:
+                yaw = math.atan2(p[1] - self.pan_xy[1], p[0] - self.pan_xy[0])
+            R = rpy_to_matrix(roll, pitch, yaw) @ self.home_R
         kw = dict(rot_weight=self.get_parameter("rot_weight").value)
         tol = self.get_parameter("max_pos_err").value
 
         res = solve_ik(self.chain, p, R, q0=self.q, max_iters=50, **kw)
         if res.pos_err > tol:  # warm start stuck: try fresh seeds
             res = solve_ik_restarts(self.chain, p, R, q0=self.q, accept_tol=tol / 2, **kw)
+        if res.pos_err > tol and R is not None:
+            # pitch past the wrist's reach: back the pitch off toward level
+            # before dropping orientation (which can flip the gripper over)
+            for s in (0.75, 0.5, 0.25):
+                Rs = rpy_to_matrix(roll, s * pitch, yaw) @ self.home_R
+                r2 = solve_ik(self.chain, p, Rs, q0=self.q, max_iters=50, **kw)
+                if r2.pos_err <= tol:
+                    res = r2
+                    self.get_logger().warn(f"pitch {math.degrees(pitch):.0f} deg unreachable, "
+                                           f"using {math.degrees(s * pitch):.0f}",
+                                           throttle_duration_sec=2.0)
+                    break
         if res.pos_err > tol and R is not None:
             # orientation is best effort: give it up before giving up position
             res = solve_ik_restarts(self.chain, p, None, q0=self.q, accept_tol=tol / 2)
