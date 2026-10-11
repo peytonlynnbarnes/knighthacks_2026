@@ -70,28 +70,35 @@ JOINT_CAL = {
     "shoulder_lift": (+1, CENTER),
     "elbow_flex": (+1, CENTER),
     "wrist_flex": (+1, CENTER),
-    "wrist_roll": (+1, CENTER),
+    # wrist_roll's Homing_Offset was moved 1731 -> 1542 (2026-10-11, set_homing_offset.py):
+    # its reading is +189 ticks from before, so the URDF zero (was 2048) is now 2237, and the
+    # 0/4095 seam sits inside the wrist's hard stop (see SOFT_LIMITS)
+    "wrist_roll": (+1, CENTER + 189),
 }
 
 
-# Home = base pose (base_pose.py): every arm joint at 2048. Visually checked
-# on hardware (2026-10-09) to match the URDF zero L-pose.
-HOME = {name: CENTER for name in JOINT_CAL}
+# Home = base pose: every arm joint at its URDF zero (JOINT_CAL; 2048 except wrist_roll,
+# whose reading was shifted). Visually checked on hardware (2026-10-09) to match the URDF
+# zero L-pose. (base_pose.py / jog.py keep their own 2048: don't use them on wrist_roll.)
+HOME = {name: zero for name, (_, zero) in JOINT_CAL.items()}
 
 # Soft limits (ticks): the usable range = the hand-measured range of motion
 # (calib/ranges_session1.json) intersected with the EEPROM limits read from the
 # servos (2026-10-09), so the IK (which can't read the bus) plans exactly what
 # feetech_mirror allows. Measured, where EEPROM is narrower: shoulder_lift 815,
 # elbow_flex 3176, wrist_flex 694, gripper 3523.
-# wrist_roll's travel crosses the 0/4095 seam (2878 -> 4095/0 -> 2645), and
-# position mode can't pass the seam, so it's kept on the side containing
-# home (2048): 0..2645.
+# wrist_roll: its hard stop (~27 deg) was measured by hand, torque off (2026-10-11): the
+# travel ends read 993 and 1298 with Homing_Offset 396, i.e. ~333 deg of travel that crossed
+# the 0/4095 seam (position mode can't), so only ~205 deg was usable (calib/ranges_session1
+# .json's arc was wrong about where the stop is). Offset 1542 puts the seam in the middle of
+# the stop. Probed live with block detection (slow, stops at ~30 % load): the travel reads
+# 110..3987 (341 deg; the stop's middle = the seam); kept 25 ticks inside: -185..+152 deg.
 SOFT_LIMITS = {
     "shoulder_pan": (1272, 3000),
     "shoulder_lift": (1067, 3199),
     "elbow_flex": (944, 2879),
     "wrist_flex": (833, 3071),
-    "wrist_roll": (0, 2645),
+    "wrist_roll": (135, 3962),
     "gripper": (2007, 3298),
 }
 
@@ -151,7 +158,10 @@ class Bus:
         missed status packet (seen while several servos move, presumably a
         supply/USB hiccup) shouldn't abort a run; persistent failure still raises."""
         for attempt in range(RETRIES + 1):
-            out = fn()
+            try:
+                out = fn()
+            except IndexError:  # the SDK on a truncated reply (seen right after EEPROM writes)
+                out = (None, scs.COMM_RX_CORRUPT, 0)
             res = out[1] if isinstance(out, tuple) and len(out) == 3 else out[0]
             if res == scs.COMM_SUCCESS:
                 if attempt:
