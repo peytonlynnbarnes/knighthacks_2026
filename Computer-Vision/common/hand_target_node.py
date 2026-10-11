@@ -79,6 +79,7 @@ import argparse
 import json
 import math
 import sys
+import threading
 import time
 from collections import deque
 
@@ -467,114 +468,185 @@ def main():
     last_print, fps_n, fps_t, fps = 0.0, 0, time.monotonic(), 0.0
     target, why = None, ""
     jitter = Jitter()
-    try:
-        while True:
-            pr = cam.pair()
-            if pr is None:
-                continue
-            f0, f1, t = pr
-            if frec is not None:
-                frec.add(f0, f1, t, cam.t0, cam.t1)
-            px0, px1_raw = lms(f0, f1, t)
-            if rec is not None:
-                rec.add(t, cam.t0, cam.t1, px0, px1_raw)
-            px1 = px1_raw if skew is None else skew(px1_raw, cam.t1, cam.t0)
-            pose, why = est.estimate(px0, px1, t)
-            status = ""
-            published = False
 
-            if calib is not None:
-                if calib.feed(pose, t):
-                    if replaying:  # don't overwrite the live calibration
-                        print(f"hand calibrated ({calib.msg})")
-                    else:
-                        save_hand(calib.result, hand_path(args.backend))
-                        print(f"hand calibrated ({calib.msg}); saved {hand_path(args.backend)}")
-                    start_tracking(calib.result)
-                    calib = None
-                    lost_since = None
+    def recalibrate():
+        nonlocal calib, target
+        calib, target = HandCalibrator(args.frame, not args.no_range_calib), None  # stops publishing
+        for r in (rec, frec):
+            if r is not None:
+                r.mark_recal()
+
+    def process_pair():
+        """One stereo pair: landmarks -> pose -> calibration / mapping -> publish + terminal
+        line. Returns what the preview draws, or None when no pair came."""
+        nonlocal calib, lost_since, grip, last_print, fps_n, fps_t, fps, target, why
+        pr = cam.pair()
+        if pr is None:
+            return None
+        f0, f1, t = pr
+        if frec is not None:
+            frec.add(f0, f1, t, cam.t0, cam.t1)
+        px0, px1_raw = lms(f0, f1, t)
+        if rec is not None:
+            rec.add(t, cam.t0, cam.t1, px0, px1_raw)
+        px1 = px1_raw if skew is None else skew(px1_raw, cam.t1, cam.t0)
+        pose, why = est.estimate(px0, px1, t)
+        status = ""
+        published = False
+
+        if calib is not None:
+            if calib.feed(pose, t):
+                if replaying:  # don't overwrite the live calibration
+                    print(f"hand calibrated ({calib.msg})")
                 else:
-                    status = calib.instructions()
-                if log is not None:
-                    log.add(t, 0, pose)
-            elif pose is not None:
-                if lost_since is not None and t - lost_since >= args.reanchor_s:
-                    mapper.reanchor(pose["p"], pose["R"])  # clutch release: no jump
+                    save_hand(calib.result, hand_path(args.backend))
+                    print(f"hand calibrated ({calib.msg}); saved {hand_path(args.backend)}")
+                start_tracking(calib.result)
+                calib = None
                 lost_since = None
-                jitter.add(t, pose["p"], pose["R"])
-                raw_p, raw_R = mapper.raw_target(pose["p"], pose["R"])
-                target = mapper.update(pose["p"], pose["R"], t, pose.get("err"), pose["mode"] != "stereo")
-                out = target.copy()
-                if args.no_orientation:
-                    out[3:] = 0.0
-                pub(out)
-                published = True
-                status = f"TRACKING [{pose['mode']}]"
-                # mono (no curl) or palm turned away -> the gripper holds
-                grip = grip_f(pose["curl"], mapper.palm_angle, t)
-                if grip is not None:
-                    pub.grip(grip)
-                    curl_s = "  -- " if pose["curl"] is None else f"{pose['curl']:.2f}"
-                    status += f" grip {grip:.2f}{'H' if grip_f.held else ' '}(curl {curl_s})"
-                if log is not None:
-                    log.add(t, 1, pose, np.concatenate([raw_p, h3.matrix_to_rpy(raw_R)]), out, grip)
             else:
-                if lost_since is None:
-                    lost_since = t
-                if log is not None:
-                    log.add(t, 2)
-                jitter.clear()
-                status = f"no hand (clutch: holding): {why}"
+                status = calib.instructions()
+            if log is not None:
+                log.add(t, 0, pose)
+        elif pose is not None:
+            if lost_since is not None and t - lost_since >= args.reanchor_s:
+                mapper.reanchor(pose["p"], pose["R"])  # clutch release: no jump
+            lost_since = None
+            jitter.add(t, pose["p"], pose["R"])
+            raw_p, raw_R = mapper.raw_target(pose["p"], pose["R"])
+            target = mapper.update(pose["p"], pose["R"], t, pose.get("err"), pose["mode"] != "stereo")
+            out = target.copy()
+            if args.no_orientation:
+                out[3:] = 0.0
+            pub(out)
+            published = True
+            status = f"TRACKING [{pose['mode']}]"
+            # mono (no curl) or palm turned away -> the gripper holds
+            grip = grip_f(pose["curl"], mapper.palm_angle, t)
+            if grip is not None:
+                pub.grip(grip)
+                curl_s = "  -- " if pose["curl"] is None else f"{pose['curl']:.2f}"
+                status += f" grip {grip:.2f}{'H' if grip_f.held else ' '}(curl {curl_s})"
+            if log is not None:
+                log.add(t, 1, pose, np.concatenate([raw_p, h3.matrix_to_rpy(raw_R)]), out, grip)
+        else:
+            if lost_since is None:
+                lost_since = t
+            if log is not None:
+                log.add(t, 2)
+            jitter.clear()
+            status = f"no hand (clutch: holding): {why}"
 
-            if time.monotonic() - last_print > 0.5:
-                last_print = time.monotonic()
-                line = f"{'PUB ' if published and not args.no_ros else '    '}{status:<34} {fps:3.0f} fps"
-                if target is not None and calib is None:
-                    x, y, z, r, p, yw = target
-                    line += (f"  xyz cm {x * 100:+6.1f} {y * 100:+6.1f} {z * 100:+6.1f}  "
-                             f"rpy deg {math.degrees(r):+5.0f} {math.degrees(p):+5.0f} "
-                             f"{math.degrees(yw):+5.0f}")
-                    hr = np.degrees(mapper.hand_rpy)
-                    line += (f"  hand {hr[0]:+4.0f} {hr[1]:+4.0f} {hr[2]:+4.0f}"
-                             f"  palm {mapper.palm_angle:2.0f}deg{'' if mapper.trust > 0 else ' HELD'}")
-                    jit = jitter.read()
-                    if jit is not None:
-                        line += f"  jitter {jit[0]:4.1f} mm {jit[1]:4.1f} deg"
-                print(line, flush=True)
-
-            if replaying and cam.recalibrate_now():
-                calib, target = HandCalibrator(args.frame, not args.no_range_calib), None
-            fps_n += 1
-            if time.monotonic() - fps_t > 1.0:
-                fps, fps_n, fps_t = fps_n / (time.monotonic() - fps_t), 0, time.monotonic()
-            if args.no_view:
-                continue
-            draw_hand(f0, px0)
-            draw_hand(f1, px1_raw)
-            if pose is not None:
-                draw_axes(f0, pose, rig["K0"], rig["d0"])
-            view = np.hstack([f0, f1])
-            lines = [status, f"{fps:.0f} fps, skew {(cam.t1 - cam.t0) * 1000:+.0f} ms"]
+        if time.monotonic() - last_print > 0.5:
+            last_print = time.monotonic()
+            line = f"{'PUB ' if published and not args.no_ros else '    '}{status:<34} {fps:3.0f} fps"
             if target is not None and calib is None:
                 x, y, z, r, p, yw = target
-                lines.append(f"offset cm x{x * 100:+.1f} y{y * 100:+.1f} z{z * 100:+.1f}  "
-                             f"rpy deg {math.degrees(r):+.0f} {math.degrees(p):+.0f} "
-                             f"{math.degrees(yw):+.0f}")
-            for i, s in enumerate(lines):
-                cv2.putText(view, s, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                            (0, 0, 255) if pose is None else (0, 255, 255), 2)
-            cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", fit_view(view))
-            k = cv2.waitKey(1) & 0xFF
-            if k in (ord("q"), 27):
-                break
-            if k == ord("c"):
-                calib, target = HandCalibrator(args.frame, not args.no_range_calib), None  # stops publishing
-                for r in (rec, frec):
-                    if r is not None:
-                        r.mark_recal()
+                line += (f"  xyz cm {x * 100:+6.1f} {y * 100:+6.1f} {z * 100:+6.1f}  "
+                         f"rpy deg {math.degrees(r):+5.0f} {math.degrees(p):+5.0f} "
+                         f"{math.degrees(yw):+5.0f}")
+                hr = np.degrees(mapper.hand_rpy)
+                line += (f"  hand {hr[0]:+4.0f} {hr[1]:+4.0f} {hr[2]:+4.0f}"
+                         f"  palm {mapper.palm_angle:2.0f}deg{'' if mapper.trust > 0 else ' HELD'}")
+                jit = jitter.read()
+                if jit is not None:
+                    line += f"  jitter {jit[0]:4.1f} mm {jit[1]:4.1f} deg"
+            print(line, flush=True)
+
+        if replaying and cam.recalibrate_now():
+            calib, target = HandCalibrator(args.frame, not args.no_range_calib), None
+        fps_n += 1
+        if time.monotonic() - fps_t > 1.0:
+            fps, fps_n, fps_t = fps_n / (time.monotonic() - fps_t), 0, time.monotonic()
+        return dict(f0=f0, f1=f1, px0=px0, px1=px1_raw, pose=pose, status=status, fps=fps,
+                    skew_ms=(cam.t1 - cam.t0) * 1000,
+                    target=target if calib is None else None)
+
+    def show(f0, f1, snap, cam_fps=None):
+        """Draw snap's landmarks / pose / text on f0, f1 and show them. Returns the key."""
+        draw_hand(f0, snap["px0"])
+        draw_hand(f1, snap["px1"])
+        if snap["pose"] is not None:
+            draw_axes(f0, snap["pose"], rig["K0"], rig["d0"])
+        view = np.hstack([f0, f1])
+        rate = f"{snap['fps']:.0f} fps" if cam_fps is None else \
+            f"model {snap['fps']:.0f} pairs/s, view {cam_fps:.0f} fps"
+        lines = [snap["status"], f"{rate}, skew {snap['skew_ms']:+.0f} ms"]
+        if snap["target"] is not None:
+            x, y, z, r, p, yw = snap["target"]
+            lines.append(f"offset cm x{x * 100:+.1f} y{y * 100:+.1f} z{z * 100:+.1f}  "
+                         f"rpy deg {math.degrees(r):+.0f} {math.degrees(p):+.0f} "
+                         f"{math.degrees(yw):+.0f}")
+        for i, s in enumerate(lines):
+            cv2.putText(view, s, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                        (0, 0, 255) if snap["pose"] is None else (0, 255, 255), 2)
+        cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", fit_view(view))
+        return cv2.waitKey(1) & 0xFF
+
+    # live cameras with a window: WiLoR and everything after it run in a worker thread, the
+    # main thread (macOS: windows only work there) shows the newest camera frames at camera
+    # rate with the newest result drawn on them. Replays and --no-view stay single-threaded
+    # (deterministic, same output as before).
+    threaded = not args.no_view and not replaying and isinstance(cam, StereoCam)
+    worker, stop = None, threading.Event()
+    try:
+        if not threaded:
+            while True:
+                snap = process_pair()
+                if snap is None or args.no_view:
+                    continue
+                k = show(snap["f0"], snap["f1"], snap)
+                if k in (ord("q"), 27):
+                    break
+                if k == ord("c"):
+                    recalibrate()
+        else:
+            lock, latest, failed, want_recal = threading.Lock(), [None], [], threading.Event()
+
+            def work():
+                try:
+                    while not stop.is_set():
+                        if want_recal.is_set():
+                            want_recal.clear()
+                            recalibrate()
+                        snap = process_pair()
+                        if snap is not None:
+                            with lock:
+                                latest[0] = snap
+                except BaseException as e:  # shown and re-raised by the main thread
+                    failed.append(e)
+                    stop.set()
+
+            worker = threading.Thread(target=work, name="hand-pipeline", daemon=True)
+            worker.start()
+            seq, view_n, view_t, view_fps = -1, 0, time.monotonic(), 0.0
+            while not stop.is_set():
+                f0, _, s0 = cam.c0.wait_new(seq, timeout=0.2)
+                if f0 is None or s0 == seq:
+                    continue
+                seq = s0
+                f1 = cam.c1.latest()[0]
+                with lock:
+                    snap = latest[0]
+                if f1 is None or snap is None:
+                    continue
+                view_n += 1
+                if time.monotonic() - view_t > 1.0:
+                    view_fps, view_n, view_t = view_n / (time.monotonic() - view_t), 0, time.monotonic()
+                # copies: the worker may be reading these same frames
+                k = show(f0.copy(), f1.copy(), snap, view_fps)
+                if k in (ord("q"), 27):
+                    break
+                if k == ord("c"):
+                    want_recal.set()
+            if failed:
+                raise failed[0]
     except (KeyboardInterrupt, ReplayEnd):
         pass
     finally:
+        stop.set()
+        if worker is not None:
+            worker.join(timeout=5.0)  # finish the pair in flight before closing cameras / ROS
         for r in (rec, frec):
             if r is not None:
                 r.save()
