@@ -13,6 +13,16 @@ Used by scripts/ik_node.py; testable without ROS. Strategy per target:
    last published one (a branch flip, or a glitch in the target) is held back
    until confirm consecutive ticks agree on it.
 
+Claw down (claw_down = (z_full, z_top, deg_top)): the target pitch comes from the tip
+height, not the hand's tilt: straight down (90 deg) at z <= z_full, linearly less down
+above it (deg_top at z_top, same slope beyond, never above level). Pick and place: the
+claw hangs over the object near the table. The default line (4 cm -> 90, 20 cm -> 50)
+follows what the arm can reach on the centre of the workspace (soft limits, measured
+2026-10-10: 90 / 79 / 69 / 59 / 48 deg at 2 / 8 / 12 / 16 / 20 cm); where it can't (far
+out), the claw tilts as little as it can (orientation is the secondary task; position
+stays exact). floor_z: the target tip height never goes below this (m, base_link; the
+table is at z ~ 0), so normal use hovers just above the table without touching it.
+
 Two-hand mode: solve(offset, roll_lock=rad) holds wrist_roll at the other hand's
 command and solves position + pitch around it; the orientation target takes its
 roll from the lock, and the branch guard ignores wrist_roll (a commanded change).
@@ -35,12 +45,14 @@ HOME_Q_DEG = (0.0, -51.0, 63.8, -12.8, 0.0)
 class TargetSolver:
     def __init__(self, chain, home_p, home_R, use_orientation=True, free_yaw=True,
                  rot_weight=0.5, max_pos_err=0.01, jump_deg=30.0, confirm=3,
-                 budget_s=0.02, seed=0, rot_damping=0.1):
+                 budget_s=0.02, seed=0, rot_damping=0.1, claw_down=None, floor_z=None):
         self.chain, self.home_p, self.home_R = chain, np.asarray(home_p), np.asarray(home_R)
         _, frames = chain.fk(np.zeros(len(chain.active)), return_frames=True)
         self.pan_xy = frames[0][0][:2]  # pan axis location in base_link
         self.use_orientation, self.free_yaw = use_orientation, free_yaw
         self.rot_damping = rot_damping
+        self.claw_down = claw_down  # (z_full m, z_top m, deg_top) or None: pitch from the target
+        self.floor_z = floor_z      # m, lowest target tip height, or None
         self.rot_weight, self.tol = rot_weight, max_pos_err
         self.jump, self.confirm, self.budget = math.radians(jump_deg), confirm, budget_s
         self.q_home = np.clip(np.radians(HOME_Q_DEG), chain.lower, chain.upper)
@@ -59,14 +71,24 @@ class TargetSolver:
         """Absolute (p, R or None) for an offset from home, yaw freed if set; with
         roll_lock (wrist_roll, rad) the roll is the one that joint angle gives."""
         p = self.home_p + np.asarray(offset[:3], dtype=float)
+        if self.floor_z is not None and p[2] < self.floor_z:
+            p[2] = self.floor_z
         if not self.use_orientation:
             return p, None
         roll, pitch, yaw = offset[3:6]
+        if self.claw_down is not None:
+            pitch = self.claw_pitch(p[2])
         if roll_lock is not None:
             roll = self.roll_sign * roll_lock
         if self.free_yaw:
             yaw = math.atan2(p[1] - self.pan_xy[1], p[0] - self.pan_xy[0])
         return p, rpy_to_matrix(roll, pitch, yaw) @ self.home_R
+
+    def claw_pitch(self, z):
+        """Claw-down target pitch (rad, + = down) at tip height z (m)."""
+        z_full, z_top, deg_top = self.claw_down
+        deg = 90.0 + (deg_top - 90.0) * (z - z_full) / (z_top - z_full)
+        return math.radians(min(90.0, max(0.0, deg)))
 
     def _ik(self, p, R, q0, iters, lock=None):
         posture = dict(q_rest=self.q_home) if R is None else {}
@@ -158,6 +180,25 @@ def _selftest():
     s.solve(np.zeros(6), roll_lock=0.0)
     q = s.solve(np.zeros(6), roll_lock=-1.4)
     assert q is not None and abs(q[i] + 1.4) < 1e-9, s.info
+    # claw down: pitch from the height (the hand's pitch is ignored), floor, roll lock
+    claw = (0.04, 0.20, 50.0)
+    s = TargetSolver(chain, home_p, home_R, claw_down=claw, floor_z=0.02, jump_deg=360.0)
+    assert abs(math.degrees(s.claw_pitch(0.04)) - 90) < 1e-9 and abs(math.degrees(s.claw_pitch(0.20)) - 50) < 1e-9
+    assert math.degrees(s.claw_pitch(0.0)) == 90.0 and math.degrees(s.claw_pitch(0.60)) == 0.0
+    low = np.r_[np.array([0.22, 0.0, 0.04]) - home_p, 0.0, -0.5, 0.0]
+    q = s.solve(low)
+    assert q is not None and s.info["rot_err"] < math.radians(3), s.info  # straight down
+    tilts = []
+    for z in (0.08, 0.12, 0.16):  # centre of the workspace: on the schedule
+        q = s.solve(np.r_[np.array([0.27, 0.0, z]) - home_p, 0.0, 0.0, 0.0])
+        assert q is not None and s.info["pos_err"] < 0.005, (z, s.info)
+        tilts.append(math.degrees(s.info["rot_err"]))
+    assert max(tilts) < 5, tilts
+    q = s.solve(np.r_[np.array([0.22, 0.0, -0.03]) - home_p, 0.0, 0.0, 0.0])  # below the floor
+    assert q is not None and abs(chain.fk(q)[2, 3] - 0.02) < 0.005, chain.fk(q)[2, 3]
+    s2 = TargetSolver(chain, home_p, home_R, claw_down=claw, jump_deg=360.0)
+    q = s2.solve(low, roll_lock=-0.7)  # with the left hand's roll: still down, roll exact
+    assert q is not None and abs(q[i] + 0.7) < 1e-9 and s2.info["rot_err"] < math.radians(3), s2.info
     print(f"ik_solver self-test OK: roll lock exact, {n_ok}/{n_free_ok} targets solved (locked/free), "
           f"pos err max {worst['pos'] * 1000:.2f} / {worst['pos_free'] * 1000:.2f} mm, "
           f"roll sign {s.roll_sign:+.0f}")

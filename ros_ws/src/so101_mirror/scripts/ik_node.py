@@ -57,10 +57,19 @@ Parameters:
                      linearly between the targets around that moment; ~one
                      normal gap between targets. 0 = latest target, as is.
                      With interp_auto_max > 0 this is the minimum
+    claw_down        true (default): the claw's pitch comes from the tip height, not the
+                     hand's tilt: straight down at z <= claw_full_z, linearly less down
+                     above (claw_top_deg at claw_top_z); out of reach, it tilts as little
+                     as the wrist allows. false = pitch from the target
+    claw_full_z, claw_top_z, claw_top_deg   that line (m base_link, m, deg): 0.04, 0.20, 50
+    floor_z          lowest target tip height (m base_link, table ~ 0): 0.02. The target
+                     is clipped there (normal use hovers just above the table)
     interp_auto_max  > 0: the delay follows the target rate (0.9 x the median
-                     recent gap, at most this, s); 0 (default) = fixed interp_delay
-                     (the auto delay added ~50 ms of lag in two-hand mode)
-    smooth_tau       extra time-based smoothing of the target (s), 0 = off
+                     recent gap, at most this, s; default 0.12); 0 = fixed interp_delay.
+                     A fixed 40 ms at ~13 targets/s ran past the newest target every
+                     gap: held, then jumped (a 13 Hz staircase, the arm shook; 2026-10-11)
+    smooth_tau       extra time-based smoothing of the target (s), 0 = off; default
+                     0.03 (spline tests: shoulder_pan jitter 35 -> 6 %, +25 ms lag)
                      (smoothing belongs in the CV node; this replaced the
                      per-message EMA `alpha`, which smoothed more at higher fps)
     max_pos_err      reject solutions worse than this (m)
@@ -95,9 +104,14 @@ class IKNode(Node):
         self.declare_parameter("jump_confirm", 3)
         self.declare_parameter("solve_budget_s", 0.02)
         self.declare_parameter("hw_limits_file", HW_LIMITS_FILE)
+        self.declare_parameter("claw_down", True)
+        self.declare_parameter("claw_full_z", 0.04)
+        self.declare_parameter("claw_top_z", 0.20)
+        self.declare_parameter("claw_top_deg", 50.0)
+        self.declare_parameter("floor_z", 0.02)
         self.declare_parameter("interp_delay", 0.04)
-        self.declare_parameter("interp_auto_max", 0.0)
-        self.declare_parameter("smooth_tau", 0.0)
+        self.declare_parameter("interp_auto_max", 0.12)
+        self.declare_parameter("smooth_tau", 0.03)
         self.declare_parameter("max_pos_err", 0.01)
         self.declare_parameter("rate", 30.0)
         self.declare_parameter("stale_s", 0.5)
@@ -119,12 +133,16 @@ class IKNode(Node):
             self.chain, self.home_p, self.home_R, use_orientation=gp("use_orientation"),
             free_yaw=gp("free_yaw"), rot_weight=gp("rot_weight"), rot_damping=gp("rot_damping"),
             max_pos_err=gp("max_pos_err"), jump_deg=gp("jump_deg"), confirm=gp("jump_confirm"),
-            budget_s=gp("solve_budget_s"))
+            budget_s=gp("solve_budget_s"),
+            claw_down=(gp("claw_full_z"), gp("claw_top_z"), gp("claw_top_deg")) if gp("claw_down") else None,
+            floor_z=gp("floor_z"))
         self.ws_min = np.array(gp("workspace_min"))
         self.ws_max = np.array(gp("workspace_max"))
 
         self.interp = TargetInterpolator(delay=gp("interp_delay"), tau=gp("smooth_tau"),
                                          auto_max=gp("interp_auto_max"))
+        self.roll_interp = TargetInterpolator(delay=gp("interp_delay"), tau=gp("smooth_tau"),
+                                              auto_max=gp("interp_auto_max"))
         self.target = None                   # latest accepted offset [x y z r p y]
         self.target_t = None
         self.pubs = {j: self.create_publisher(Float64, ARM_TOPIC_PREFIX + j, 10)
@@ -133,20 +151,31 @@ class IKNode(Node):
         self.roll_cmd = None  # (rad, time) from WRIST_ROLL_TOPIC
         self.create_subscription(Float64, WRIST_ROLL_TOPIC, self.on_roll, 10)
         self.create_timer(1.0 / gp("rate"), self.tick)
-        self.get_logger().info(f"IK ready: {BALL_TOPIC} (offset from home EE "
+        claw = (f"claw down below {gp('claw_full_z') * 100:.0f} cm, {gp('claw_top_deg'):.0f} deg at "
+                f"{gp('claw_top_z') * 100:.0f} cm" if gp("claw_down") else "pitch from target")
+        self.get_logger().info(f"IK ready ({claw}; floor {gp('floor_z') * 100:.1f} cm): {BALL_TOPIC} (offset from home EE "
                                f"{np.round(self.home_p, 4)}) -> {ARM_TOPIC_PREFIX}<joint>, "
                                f"limits lo={np.round(self.chain.lower, 2)} hi={np.round(self.chain.upper, 2)}")
 
     def on_roll(self, msg):
         if math.isfinite(msg.data):
-            self.roll_cmd = (float(msg.data), self.get_clock().now())
+            now = self.get_clock().now()
+            if self.roll_cmd is None or \
+                    (now - self.roll_cmd[1]).nanoseconds * 1e-9 > self.get_parameter("stale_s").value:
+                self.roll_interp.reset()
+            self.roll_cmd = (float(msg.data), now)
+            self.roll_interp.add(now.nanoseconds * 1e-9, np.array([0, 0, 0, float(msg.data), 0, 0]))
 
     def roll_lock(self):
-        """The other hand's wrist_roll command while fresh, else None (IK picks the roll)."""
+        """The other hand's wrist_roll command while fresh, else None (IK picks the roll).
+        Interpolated in time like the position target (it arrives at the camera rate;
+        used as is, wrist_roll stepped at ~13 Hz)."""
         if self.roll_cmd is None:
             return None
-        age = (self.get_clock().now() - self.roll_cmd[1]).nanoseconds * 1e-9
-        return self.roll_cmd[0] if age <= self.get_parameter("stale_s").value else None
+        now = self.get_clock().now()
+        if (now - self.roll_cmd[1]).nanoseconds * 1e-9 > self.get_parameter("stale_s").value:
+            return None
+        return float(self.roll_interp.sample(now.nanoseconds * 1e-9)[3])
 
     def on_target(self, msg):
         d = np.array(msg.data, dtype=float)
