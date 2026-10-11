@@ -7,7 +7,8 @@ node connects (NodeLink) and, instead of cv2.imshow, sends each preview frame:
 
 meta: {"w", "h", "lines": [status lines], "arm": [text, alarm] | null,
        "kind": "calib" | "track" | "hold" | "lost", "loading": str (no image)}.
-The app sends one-byte commands back: b"c" recalibrate, b"q" quit. A closed
+The app sends one-byte commands back: b"c" recalibrate, b"q" quit, b"r" / b"p" record /
+play the arm path (meta "path": PathRecorder.status()). A closed
 socket counts as "q" (the app went away: the node stops).
 
 Sending never blocks the caller: a sender thread takes only the newest frame (a slow

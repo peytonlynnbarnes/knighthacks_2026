@@ -7,6 +7,8 @@ start() launches, each in its own process group, with the app's python / environ
 The hand node connects back to a localhost socket here (Computer-Vision/common/ui_link.py)
 and streams its preview (both cameras side by side, hands drawn) plus status lines.
 calibrate() sends it 'c' (or starts everything with --calibrate when stopped).
+record() / play() send it 'r' / 'p': record the arm's path, play it back (each again: stop;
+Computer-Vision/common/path_record.py); path() is its state from the preview meta.
 stop() asks the hand node to quit ('q'), then Ctrl-C (SIGINT) to feetech_mirror (it
 leaves the arm holding its pose) and the IK; SIGTERM / SIGKILL only if one hangs.
 torque_off() makes the arm go limp (it DROPS; the app confirms first): while running it
@@ -53,6 +55,7 @@ class Pipeline:
         self.hand_args, self.arm_args = list(hand_args), list(arm_args)
         self.lock = threading.Lock()
         self.frame, self.seq, self.status, self.status_until, self.arm = None, 0, None, 0.0, None
+        self.path_st = None       # the hand node's PathRecorder.status() (record / play)
         self.state = "idle"
         self.procs = {}           # name -> Popen
         self.tails = {}           # name -> last output lines
@@ -118,6 +121,24 @@ class Pipeline:
         elif conn is not None:
             self._send(b"c")
             print("[ui] hand recalibration requested", flush=True)
+
+    def path(self):
+        """{"mode": idle | rec | glide | play, "t", "len", "note"} while running, else None."""
+        with self.lock:
+            return self.path_st if self.state == "running" else None
+
+    def record(self):
+        self._path_cmd(b"r", "path recording toggled")
+
+    def play(self):
+        self._path_cmd(b"p", "path playback toggled")
+
+    def _path_cmd(self, b, what):
+        with self.lock:
+            ok = self.state == "running" and self.conn is not None
+        if ok:
+            self._send(b)
+            print(f"[ui] {what}", flush=True)
 
     def stop(self, release=False):
         with self.lock:
@@ -250,6 +271,7 @@ class Pipeline:
                     if not (self.status and self.status[2] == "error" and time.monotonic() < self.status_until):
                         self.status = (lines[0] if lines else "", "\n".join(lines[1:]), meta.get("kind", "hold"))
                     self.arm = meta.get("arm")
+                    self.path_st = meta.get("path")
         except (OSError, ConnectionError, ValueError):
             pass
         conn.close()
@@ -283,7 +305,7 @@ class Pipeline:
             time.sleep(0.05)
         released = released()
         with self.lock:
-            self.procs, self.frame, self.arm = {}, None, None
+            self.procs, self.frame, self.arm, self.path_st = {}, None, None, None
             if not release:
                 self.state = "idle"
             if self.conn is not None:

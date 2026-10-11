@@ -6,9 +6,16 @@
     python ui/app.py --dry-run       # feetech_mirror dry run (reads the arm, no torque)
     python ui/app.py --dry-run --no-bus   # no arm attached
     python ui/app.py -- --timing     # anything after -- goes to hand_target_node.py
-    q / Esc quits (stops everything first).
+    q / Esc quits (stops everything first). Ctrl-C in the terminal too.
 
-One Start / Stop button. Start (idle) runs the IK node, feetech_mirror.py (--gripper,
+Started from a terminal, it re-runs itself as the "Mimisis" app (its own Dock icon, Cmd-Tab
+entry and camera permission; output stays in the terminal; macos_app.py, as the hand
+tracker does); --no-app runs it in the terminal's process.
+
+One Start / Stop button. Record (while running) records the arm's path: what the hand
+commands, with its timing; click again to stop. Play sends the last take back to the arm
+(it glides to the start first, then back to the hand when done; click again to stop).
+The take is saved and comes back at the next start (Computer-Vision/common/path_record.py). Start (idle) runs the IK node, feetech_mirror.py (--gripper,
 live unless --dry-run) and hand_target_node.py (two hands; the saved hand calibration
 if there is one, else the calibration steps show in the status bar); the button then
 turns into Stop, which ends all three (the arm holds its pose). Calibrate redoes the hand calibration (starting everything if stopped). Torque
@@ -26,8 +33,8 @@ bundled in ui/fonts (OFL). --contrast prints the text contrast ratios.
 
 Layout: the logo + name in the top margin; the camera card (preview, keeping its aspect
 ratio, with the status bar attached under it: state, readout, arm driver, process dots,
-LIVE / DRY RUN) and the button row centered below: Start/Stop, Calibrate, and Torque
-Off apart, in red.
+LIVE / DRY RUN) and the button row centered below: Start/Stop, Calibrate, Record, Play,
+and Torque Off in red.
 """
 import argparse
 import os
@@ -88,8 +95,8 @@ KIND_COLOR = {"calib": LILAC, "hold": MUTED, "lost": FIREFLY, "info": LILAC, "tr
 KIND_LABEL = {"idle": "Idle", "starting": "Starting…", "running": "Waiting for a hand", "stopping": "Stopping…"}
 
 # Base sizes at a 1400 x 820 window; everything scales from these.
-BUTTON_SIZE = (220, 60)
-BUTTON_GAP = 40          # even gaps: the row is symmetric about the window's center
+BUTTON_SIZE = (190, 60)  # five in a row
+BUTTON_GAP = 28          # even gaps: the row is symmetric about the window's center
 STATUS_H = 58            # status bar under the camera
 STACK_GAP = 30           # status bar -> buttons
 BOTTOM_MARGIN = 30
@@ -173,7 +180,7 @@ def soft_shadow(p, rect, radius, spread, alpha=0.30, dy=0.0, steps=10):
 
 
 def draw_icon(p, kind, r, color, width):
-    """Line icons in the square `r`: play, stop, target, power."""
+    """Line icons in the square `r`: play, stop, target, power, record."""
     p.save()
     pen = QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
     c, k = r.center(), r.width() / 2
@@ -198,6 +205,10 @@ def draw_icon(p, kind, r, color, width):
                        QPointF(c.x() + 1.0 * k * dx, c.y() + 1.0 * k * dy))
         p.setBrush(color)
         p.drawEllipse(c, 0.14 * k, 0.14 * k)
+    elif kind == "record":
+        p.setPen(pen)
+        p.setBrush(color)
+        p.drawEllipse(c, 0.55 * k, 0.55 * k)
     elif kind == "power":
         p.setPen(pen)
         p.setBrush(Qt.NoBrush)
@@ -258,7 +269,7 @@ class ForestButton(QAbstractButton):
         gap = (0.42 if self.armed else 0.22) * r.height()  # armed: room for the countdown ring
         x = r.center().x() - (isz + gap + tw) / 2
         ir = QRectF(x, r.center().y() - isz / 2, isz, isz)
-        draw_icon(p, icon, ir, ink, max(1.5, 0.09 * isz))
+        draw_icon(p, icon, ir, EMBER if icon == "record" and fill is None else ink, max(1.5, 0.09 * isz))
         if self.armed:  # countdown ring around the icon
             p.setPen(QPen(ink, max(1.5, 0.08 * isz), Qt.SolidLine, Qt.RoundCap))
             p.setBrush(Qt.NoBrush)
@@ -294,8 +305,13 @@ class MainWindow(QWidget):
         # one Start / Stop button: what it does (and looks like) follows the pipeline state
         self.run_btn = ForestButton("Start", "play", "primary", self)
         self.calib_btn = ForestButton("Calibrate", "target", "outline", self)
+        self.rec_btn = ForestButton("Record", "record", "outline", self)
+        self.play_btn = ForestButton("Play", "play", "outline", self)
         self.torque_btn = ForestButton("Torque Off", "power", "danger", self)
-        self.buttons = (self.run_btn, self.calib_btn, self.torque_btn)
+        self.buttons = (self.run_btn, self.calib_btn, self.rec_btn, self.play_btn, self.torque_btn)
+        self.path = None  # the hand node's record / play state
+        self.rec_btn.clicked.connect(self.pipeline.record)
+        self.play_btn.clicked.connect(self.pipeline.play)
         self.run_btn.clicked.connect(self.run_clicked)
         self.run_switched = 0.0  # when it last turned from Start to Stop or back
         self.calib_btn.clicked.connect(self.pipeline.calibrate)
@@ -364,6 +380,16 @@ class MainWindow(QWidget):
         b.setEnabled(st != "stopping")
         b.update()
         self.calib_btn.setEnabled(st in ("idle", "running"))
+        # Record / Play: while running; the button of what's going on turns into its Stop
+        path = self.path or {}
+        mode = path.get("mode", "idle")
+        for btn, active, text, icon, role in (
+                (self.rec_btn, mode == "rec", "Record", "record", "outline"),
+                (self.play_btn, mode in ("glide", "play"), "Play", "play", "outline")):
+            btn.setEnabled(st == "running" and (btn is self.rec_btn or active or path.get("len", 0) > 0))
+            btn.setText(("Stop Rec" if btn is self.rec_btn else "Stop Play") if active else text)
+            btn.icon, btn.role = ("stop", "danger" if btn is self.rec_btn else "neutral") if active else (icon, role)
+            btn.update()
         self.torque_btn.setEnabled(self.has_bus and st in ("idle", "starting", "running"))
         if not self.torque_btn.isEnabled() and self.torque_armed.isActive():
             self.torque_disarm()
@@ -464,9 +490,12 @@ class MainWindow(QWidget):
     def poll_pipeline(self):
         f, seq, status, arm, state = self.pipeline.latest()
         alive = self.pipeline.alive()
-        if state != self.state:
-            self.state = state
+        path = self.pipeline.path()
+        path_key = None if path is None else (path.get("mode"), path.get("len", 0) > 0)
+        if state != self.state or path_key != getattr(self, "path_key", None):
+            self.state, self.path, self.path_key = state, path, path_key
             self.update_buttons()
+        self.path = path
         if self.torque_btn.armed:  # countdown ring
             self.torque_btn.progress = self.torque_armed.remainingTime() / TORQUE_CONFIRM_MS
             self.torque_btn.update()
@@ -645,12 +674,18 @@ def main():
     ap.add_argument("--cams", nargs=2, default=None, metavar=("LEFT", "RIGHT"),
                     help="camera indices (default 1 0; stereo_cam.py --list)")
     ap.add_argument("--contrast", action="store_true", help="print the palette's text contrast ratios and exit")
+    ap.add_argument("--no-app", action="store_true",
+                    help="run in the terminal's process instead of as the Mimisis app (no Dock icon / Cmd-Tab "
+                         "entry of its own; camera access then belongs to the terminal)")
     args = ap.parse_args(argv)
     if args.contrast:
         for name, fg, bg in CONTRAST_PAIRS:
             r = contrast(fg, bg)
             print(f"{name:<15} {fg.name()} on {bg.name()}  {r:4.1f}:1  {'ok' if r >= 4.5 else 'LOW'}")
         return
+    if not args.no_app:  # its own app (Dock, Cmd-Tab, camera permission); returns only inside it
+        import macos_app  # Computer-Vision/common, on the path via pipeline.py
+        macos_app.relaunch_in_app(APP_NAME, "com.kh.mimisis", icon=LOGO_PATH)
     live = not (args.dry_run or args.no_bus)
     hand = list(HAND_ARGS)
     if args.cams:

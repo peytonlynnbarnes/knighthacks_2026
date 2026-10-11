@@ -24,3 +24,6 @@ Computer-Vision/WiLoR/.venv/
 # macOS (mac-version)
 .DS_Store
 *.pyc
+
+# recorded arm paths (path_record.py: r / p, the app's Record / Play)
+Computer-Vision/common/recordings/paths/

@@ -22,6 +22,9 @@ on the Objective-C runtime: no PyObjC.
     ...
     macos_app.register("Hand Tracker")  # main thread, before the first cv2.imshow
 
+ui/app.py (Mimisis, Qt) does the same with its logo as the bundle icon; Qt sets the name
+and Dock icon itself, so it doesn't call register().
+
 No-ops on other platforms; never raises over cosmetics (a failure prints one line).
 """
 import ctypes
@@ -114,16 +117,50 @@ def register(name="Hand Tracker"):
         print(f"macos_app: couldn't register as an app ({e})", flush=True)
 
 
-def _bundle(name, bundle_id):
+def _icns(png, app):
+    """The bundle's icon from a PNG (sips), redone only when the PNG changed. Returns the
+    plist entry, {} if there's no icon."""
+    if not png or not os.path.exists(png):
+        return {}
+    res = os.path.join(app, "Contents", "Resources")
+    src, icns = os.path.join(res, "icon_src.png"), os.path.join(res, "app.icns")
+    with open(png, "rb") as f:
+        data = f.read()
+    try:
+        with open(src, "rb") as f:
+            same = f.read() == data and os.path.exists(icns)
+    except OSError:
+        same = False
+    if not same:
+        os.makedirs(res, exist_ok=True)
+        # icns wants a square power-of-two image: pad + resize to 512 first
+        tmp = os.path.join(res, "icon_512.png")
+        subprocess.run(["sips", "-Z", "512", "-p", "512", "512", png, "--out", tmp],
+                       check=True, capture_output=True)
+        subprocess.run(["sips", "-s", "format", "icns", tmp, "--out", icns], check=True, capture_output=True)
+        os.remove(tmp)
+        with open(src, "wb") as f:
+            f.write(data)
+    return {"CFBundleIconFile": "app.icns"}
+
+
+def _bundle(name, bundle_id, icon=None):
     """Write the app bundle if it's missing or different (an unchanged bundle keeps its
-    camera permission). Returns its path."""
+    camera permission). icon: a PNG for the bundle (Dock / Finder / Cmd-Tab before the
+    program sets its own). Returns its path."""
     app = os.path.join(APP_DIR, f"{name}.app")
+    try:
+        icon_plist = _icns(icon, app)
+    except (OSError, subprocess.CalledProcessError) as e:
+        print(f"macos_app: no bundle icon ({e})", flush=True)
+        icon_plist = {}
     files = {
         os.path.join(app, "Contents", "Info.plist"): plistlib.dumps({
             "CFBundleIdentifier": bundle_id, "CFBundleName": name, "CFBundleDisplayName": name,
             "CFBundleExecutable": "run", "CFBundlePackageType": "APPL", "CFBundleVersion": "1",
             "LSMinimumSystemVersion": "13.0", "NSHighResolutionCapable": True,
             "NSCameraUsageDescription": "Stereo hand tracking for the SO-ARM101 (two webcams).",
+            **icon_plist,
         }),
         os.path.join(app, "Contents", "MacOS", "run"): (
             "#!/bin/bash\n"
@@ -156,10 +193,11 @@ def _bundle(name, bundle_id):
     return app
 
 
-def relaunch_in_app(name, bundle_id):
+def relaunch_in_app(name, bundle_id, icon=None):
     """Re-run this command as its own app (see the module docstring) and exit with it.
     Returns (does nothing) when not on macOS, already in the app, or without a terminal
-    to show the output in."""
+    to show the output in. icon: PNG for the bundle (optional). Child processes (e.g. the
+    Mimisis app's hand node) belong to the app too: camera access is asked for in its name."""
     if sys.platform != "darwin" or os.environ.get(IN_APP_ENV):
         return
     try:
@@ -167,7 +205,7 @@ def relaunch_in_app(name, bundle_id):
     except OSError:
         return  # piped / redirected output: stay a plain process
     try:
-        app = _bundle(name, bundle_id)
+        app = _bundle(name, bundle_id, icon)
         fd, env_file = tempfile.mkstemp(prefix="kh_env_", suffix=".sh")
         pid_file = env_file[:-3] + ".pid"
         env = {k: v for k, v in os.environ.items() if not k.startswith(SKIP_ENV) and k.isidentifier()}

@@ -52,7 +52,8 @@ Controls:
     always follows the hand relative to the calibration pose, so a hand that
     comes back turned rotates the gripper back at --max-ang. Shorter
     dropouts (bad frames) don't re-anchor.
-    Keys: q/Esc quit, c recalibrate the hand.
+    Keys: q/Esc quit, c recalibrate the hand, r record the arm's path (again: stop), p play it back
+    (again: stop; path_record.py: the take is saved and reloaded at start).
 
 Filter testing (Phase 0, see filter_eval.py):
     --record rec.npz   save the raw landmarks + capture times of every frame
@@ -97,6 +98,7 @@ import hand3d as h3
 import macos_app
 from frames import FrameRecorder, FrameReplay, ReplayEnd
 from hand_calib import HandCalibrator, LeftHandCalibrator, hand_path, load_hand, save_hand
+from path_record import PathRecorder
 from hand_mapping import (BOX_MAX, BOX_MIN, IMM_PRESETS, KALMAN_DEFAULTS, CylinderMap, GripFilter, HandMapper,
                           RollFilter, RotationShaper,
                           StereoIMM, StereoKalman, StillHold, facing_weight, gains_from_range)
@@ -210,17 +212,32 @@ class Publisher:
                     f"{time.monotonic() - self.last_stall[0]:.0f} s ago)"
         return (text + f" [{flags}]", True) if flags else (text, False)
 
+    # live commands go through the path recorder (record / play back, path_record.py), which
+    # calls send() for what actually goes out
+    path = None
+
+    def send(self, kind, v):
+        if self.node is None:
+            return
+        if kind == "target":
+            self.pub.publish(self.Msg(data=[float(x) for x in v]))
+        else:
+            (self.grip_pub if kind == "grip" else self.roll_pub).publish(self.F64(data=float(v)))
+
+    def _live(self, kind, v):
+        if self.path is not None:
+            self.path.live(kind, v)
+        else:
+            self.send(kind, v)
+
     def __call__(self, target):
-        if self.node is not None:
-            self.pub.publish(self.Msg(data=[float(v) for v in target]))
+        self._live("target", target)
 
     def grip(self, v):
-        if self.node is not None:
-            self.grip_pub.publish(self.F64(data=float(v)))
+        self._live("grip", v)
 
     def roll(self, v):
-        if self.node is not None:
-            self.roll_pub.publish(self.F64(data=float(v)))
+        self._live("roll", v)
 
     def close(self):
         if self.node is not None:
@@ -608,6 +625,17 @@ def main():
     calib = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up, not args.two_hands)  # every run: calibration hand = origin
 
     pub = Publisher(not args.no_ros)
+    # r: record the arm's path, p: play it back (also the app's Record / Play buttons);
+    # not for --replay (no preview, and its timing isn't real)
+    path_rec = None if args.replay else PathRecorder(pub.send)
+    pub.path = path_rec
+
+    def path_key(k):
+        """r / p: record / play the path. True if it was one of them."""
+        if path_rec is None or k not in (ord("r"), ord("p")):
+            return False
+        (path_rec.toggle_record if k == ord("r") else path_rec.toggle_play)()
+        return True
     cyl = CylinderMap(args.pan_span, args.pan_deg) if args.pan_mapping == "cylinder" else None
     replay = Replay(args.replay, realtime=not args.no_ros) if args.replay else None
     if replay is not None:  # the landmarks are in the file; it says which backend made them
@@ -865,6 +893,9 @@ def main():
                              f"{math.degrees(yw):+.0f}")
             if snap["left_line"]:
                 lines.append(snap["left_line"])
+            path_line = path_rec.line() if path_rec is not None else ""
+            if path_line:
+                lines.insert(1, path_line)
             if args.timing and T.last:
                 lines.append("ms " + T.summary(["wilor.forward", "wilor.yolo", "wilor.crop", "wilor.post",
                                                 "gpu.pair_wait", "pose.total", "view.draw", "view.imshow"]))
@@ -872,7 +903,8 @@ def main():
                 kind = ("calib" if snap["calibrating"] else "track" if snap["published"]
                         else "lost" if snap["target"] is not None else "hold")
                 arm = pub.arm_line()
-                ui.send({"lines": lines, "kind": kind, "arm": None if arm is None else list(arm)}, view)
+                ui.send({"lines": lines, "kind": kind, "arm": None if arm is None else list(arm),
+                         "path": None if path_rec is None else path_rec.status()}, view)
                 return ui.key()
             for i, line in enumerate(lines):
                 cv2.putText(view, line, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
@@ -887,7 +919,7 @@ def main():
                 cv2.putText(view, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75 if alarm else 0.6,
                             (255, 255, 255) if alarm else (200, 200, 200), 2)
         with T("view.imshow"):
-            cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", view)
+            cv2.imshow("hand -> /ball_position (q quits, c recalibrates, r records, p plays)", view)
             return cv2.waitKey(1) & 0xFF
 
     # reuse the saved hand calibrations (made with this camera rig) instead of calibrating at
@@ -938,6 +970,7 @@ def main():
                     break
                 if k == ord("c"):
                     recalibrate()
+                path_key(k)
         else:
             lock, latest, failed, want_recal = threading.Lock(), [None], [], threading.Event()
             handoff = queue.Queue(maxsize=1)
@@ -1008,12 +1041,15 @@ def main():
                     break
                 if k == ord("c"):
                     want_recal.set()
+                path_key(k)
             if failed:
                 raise failed[0]
     except (KeyboardInterrupt, ReplayEnd):
         pass
     finally:
         stop.set()
+        if path_rec is not None:
+            path_rec.stop_play()  # before ROS closes
         for w in workers:
             w.join(timeout=5.0)  # finish the pair in flight before closing cameras / ROS
         for r in (rec, frec):
