@@ -8,7 +8,7 @@ Frames:
             A (3x3, rows = robot axes expressed in cam coords) maps
             cam vectors to robot vectors: v_robot = A @ v_cam.
 
-Hand frame (from MediaPipe's 21 landmarks, triangulated to 3D):
+Hand frame (from the backend's 21 landmarks, OpenPose order, triangulated to 3D):
     origin = centroid of palm points {0 wrist, 5, 9, 13, 17 MCPs}
     x = wrist -> middle MCP (0 -> 9), where the hand points
     z = palm normal (5 - 0) x (17 - 0); the sign flips with chirality,
@@ -16,7 +16,7 @@ Hand frame (from MediaPipe's 21 landmarks, triangulated to 3D):
     y = z x x
 
 Self-test (synthetic stereo, no hardware):
-    .venv/bin/python Computer-Vision/common/hand3d.py
+    python Computer-Vision/common/hand3d.py
 """
 import math
 
@@ -196,6 +196,20 @@ def palm_fit(X, template):
     o = cx - R @ ct
     rms = float(np.sqrt(np.mean(np.sum((T @ R.T + o - X) ** 2, axis=1))))
     return o, R, rms
+
+
+def twist_about(R, axis):
+    """Twist angle (rad) of rotation R about a unit axis, in R's frame (swing-twist split)."""
+    v = matrix_to_rotvec(R)
+    th = float(np.linalg.norm(v))
+    if th < 1e-12:
+        return 0.0
+    return 2.0 * math.atan2(math.sin(th / 2) * float(v @ np.asarray(axis, float)) / th, math.cos(th / 2))
+
+
+def twist_x(R):
+    """Twist angle (rad) of rotation R about its body x axis (swing-twist split)."""
+    return twist_about(R, (1.0, 0.0, 0.0))
 
 
 def rotation_angle(R):

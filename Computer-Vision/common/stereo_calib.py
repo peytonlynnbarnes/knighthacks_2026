@@ -3,16 +3,20 @@
 
 Redo it whenever a camera is bumped or re-aimed, and to change resolution.
 
-Resolution: --size (default 640x480, a 4:3 center crop, ~38 deg; 1280x720 is
-the full ~50 deg view but cam0 only manages ~5 fps at it in normal light,
-USB bandwidth through usbipd, so check the fps the startup line prints). The
-rig file records the size and hand_target_node.py opens the cameras at it. Focus: find the sharpest value for a hand at working
-distance with stereo_cam.py (f key), then calibrate with --focus N. It's
-locked during calibration and saved in the rig, and the node locks the same
-value (autofocus changes the focal length the calibration measured).
+Cameras: --cams LEFT RIGHT (Linux: /dev/videoN numbers, default 0 2; macOS: the
+AVFoundation indices, find them with stereo_cam.py --list); cam0 = the left camera.
+Resolution: --size (default 640x480; on the Linux Adesso rig a 4:3 center crop,
+~38 deg; 1280x720 is the full ~50 deg view but cam0 only manages ~5 fps at it
+through usbipd, so check the fps the startup line prints). The rig file records
+the size and hand_target_node.py opens the cameras at it (the Mac scales it to
+other sizes of the same aspect ratio). Focus: set the manual focus rings first
+(stereo_cam.py shows the sharpness of each view) and don't touch them afterwards:
+turning a ring changes the focal length the calibration measured. Linux only:
+--focus N also locks the V4L2 focus (from stereo_cam.py's f sweep), saved in the
+rig, and the node locks the same value.
 
 Mode 1 (default, no equipment): calibrate from your hand.
-    .venv/bin/python Computer-Vision/common/stereo_calib.py [--hfov 38]   (default 38 at 640x480, 50 at 1280x720)
+    python Computer-Vision/common/stereo_calib.py --cams L R [--hfov 38]   (default 38 at 640x480, 50 at 1280x720)
     Move an open hand slowly all around the shared view for ~25 s: left/right,
     up/down, near/far (30-90 cm), and tilt it. The essential matrix from those
     landmark matches gives cam1's rotation and direction; the measured
@@ -21,11 +25,11 @@ Mode 1 (default, no equipment): calibrate from your hand.
     motion (what the arm uses, 1:1) is what matters.
 
 Mode 2 (more accurate): a chessboard shown on a phone/tablet screen.
-    .venv/bin/python Computer-Vision/common/stereo_calib.py --board
+    python Computer-Vision/common/stereo_calib.py --board
         -> writes calib/chessboard.png (9x6 inner corners = 10x7 squares) and exits.
     Show it full screen on the phone at max brightness, measure the width of
     all 10 squares in a row with a ruler and divide by 10, then:
-    .venv/bin/python Computer-Vision/common/stereo_calib.py --board --square-mm 9.8
+    python Computer-Vision/common/stereo_calib.py --board --square-mm 9.8 --cams L R
     Hold the phone still for each grab (blur kills detection). Two kinds of views:
       1. per camera (15 each, 6 of them TILTED 20-40 deg): hold the phone close
          (15-40 cm) to one camera so it fills much of that view; corners of the
@@ -56,8 +60,8 @@ import cv2
 import numpy as np
 
 import hand3d as h3
-from stereo_cam import (BACKENDS, BASELINE_M, HERE, RIG_PATH, StereoCam, make_landmarks,
-                        draw_hand, fit_view, save_rig)
+from stereo_cam import (BACKENDS, BASELINE_M, DEFAULT_BACKEND, DEFAULT_CAMS, HERE, MAC, RIG_PATH, StereoCam,
+                        make_landmarks, draw_hand, fit_view, save_rig)
 
 BOARD = (9, 6)  # inner corners
 
@@ -203,7 +207,8 @@ def capture_board(cam, args):
                 g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
                 ok, c = cv2.findChessboardCorners(g, BOARD, flags)
                 if ok:
-                    c = cv2.cornerSubPix(g, c, (5, 5), (-1, -1), crit)
+                    # (N, 1, 2) as in OpenCV 4; OpenCV 5 (conda's, pinned by RoboStack) returns (N, 2)
+                    c = cv2.cornerSubPix(g, c, (5, 5), (-1, -1), crit).reshape(-1, 1, 2)
                     cv2.drawChessboardCorners(f, BOARD, c, ok)
                 found.append(c if ok else None)
                 tilt.append(board_tilt(c, obj, Kg) if ok else None)
@@ -272,9 +277,11 @@ def solve_board(views, pairs, size, args):
     obj = board_points(args.square_mm)
     size = tuple(int(v) for v in size)
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
-    # few free parameters: focal (one, square pixels), center, k1/k2 only
+    # few free parameters: focal (one, square pixels), center, k1/k2 (+ k3 with --free-k3)
     cflags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_ASPECT_RATIO |
-              cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K3)
+              cv2.CALIB_ZERO_TANGENT_DIST)
+    if not args.free_k3:
+        cflags |= cv2.CALIB_FIX_K3
     if args.fix_center:
         cflags |= cv2.CALIB_FIX_PRINCIPAL_POINT
     problems, Ks, fovs = [], [], []
@@ -333,16 +340,20 @@ def solve_board(views, pairs, size, args):
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--cams", type=int, nargs=2, default=[0, 2])
-    ap.add_argument("--backend", choices=BACKENDS, default="mediapipe",
+    ap.add_argument("--cams", type=int, nargs=2, default=DEFAULT_CAMS, metavar=("LEFT", "RIGHT"),
+                    help="cam0 = left camera, cam1 = right (Linux: /dev/videoN; macOS: AVFoundation, "
+                         "stereo_cam.py --list)")
+    ap.add_argument("--backend", choices=BACKENDS, default=DEFAULT_BACKEND,
                     help="landmark backend for the hand-based calibration (not --board)")
     ap.add_argument("--size", type=int, nargs=2, default=[640, 480], metavar=("W", "H"),
                     help="capture size; the node uses whatever the rig was calibrated at")
     ap.add_argument("--focus", type=int, default=None,
-                    help="lock focus 0..1023 (from stereo_cam.py's f sweep) and save it in the "
+                    help="Linux: lock focus 0..1023 (from stereo_cam.py's f sweep) and save it in the "
                          "rig (default autofocus, not recommended)")
     ap.add_argument("--fix-center", action="store_true",
                     help="board mode: pin the principal point to the image center")
+    ap.add_argument("--free-k3", action="store_true",
+                    help="board mode: also solve k3 (wide lenses, e.g. Elgato Facecam MK.2 ~76 deg)")
     ap.add_argument("--hfov", type=float, default=None,
                     help="horizontal field of view guess (deg): hand mode intrinsics, board mode start")
     ap.add_argument("--seconds", type=float, default=25.0, help="hand mode: capture time")
@@ -391,7 +402,7 @@ def main():
             sys.exit(f"not saved (fix and rerun; or --force). Re-solve without recapturing: "
                      f"--board --square-mm {args.square_mm} --from-corners")
     K0, d0, K1, d1, R, t, method = res
-    save_rig(args.out, K0, d0, K1, d1, R, t, size, method, focus=args.focus)
+    save_rig(args.out, K0, d0, K1, d1, R, t, size, method, focus=None if MAC else args.focus)
     print(f"saved {args.out}")
 
 

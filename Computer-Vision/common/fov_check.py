@@ -3,7 +3,7 @@
 
 Independent of calibrateCamera: hold the chessboard flat-on (facing the camera
 squarely), centered, at a measured distance D from the lens, then:
-    .venv/bin/python Computer-Vision/common/fov_check.py --cam 0 --square-mm 19.5 --dist-cm 40
+    python Computer-Vision/common/fov_check.py --cam 1 --square-mm 19.5 --dist-cm 40
 Uses the center squares' pixel size (least lens distortion):
     fx = square_px * D / square,  hfov = 2 atan(width / 2 / fx).
 Prints a running estimate; q quits. dx/dy near 1.00 means the board is square-on.
@@ -14,14 +14,15 @@ import math
 import cv2
 import numpy as np
 
-from stereo_cam import Camera
+from stereo_cam import DEFAULT_CAMS, Camera
 
 BOARD = (9, 6)
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--cam", type=int, default=0, help="V4L2 index (cam0 = 0, cam1 = 2)")
+    ap.add_argument("--cam", type=int, default=DEFAULT_CAMS[0],
+                    help="cam0's index (Linux V4L2: cam0 = 0, cam1 = 2; macOS: AVFoundation, stereo_cam.py --list)")
     ap.add_argument("--square-mm", type=float, required=True)
     ap.add_argument("--dist-cm", type=float, required=True, help="lens to board distance")
     ap.add_argument("--size", type=int, nargs=2, default=[640, 480], metavar=("W", "H"))

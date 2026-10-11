@@ -5,14 +5,40 @@ out of base_pose.py for the real-time loop (feetech_mirror.py). The older
 standalone scripts keep their own copies and still work unchanged.
 
 Not a script; import it:
-    from so101_bus import Bus, NAMES, rad_to_ticks, ticks_to_rad
+    from so101_bus import Bus, NAMES, rad_to_ticks, ticks_to_rad, default_port
 """
+import glob
 import math
 import sys
 
 import scservo_sdk as scs
 
 BAUD = 1_000_000
+
+# macOS names USB serial adapters /dev/cu.* (use cu., not tty.: tty. waits for a carrier
+# signal). CDC-ACM boards are cu.usbmodem*, CH34x / FTDI bridges cu.usbserial* / cu.wchusbserial*.
+# Linux / WSL (board attached with usbipd): /dev/ttyACM* (CDC-ACM) or /dev/ttyUSB* (bridges).
+if sys.platform == "darwin":
+    PORT_GLOBS = ("/dev/cu.usbmodem*", "/dev/cu.usbserial*", "/dev/cu.wchusbserial*")
+    OPEN_HINT = "in use by another script? unplug and replug the board"
+else:
+    PORT_GLOBS = ("/dev/ttyACM*", "/dev/ttyUSB*")
+    OPEN_HINT = "attached via usbipd? chmod 666? in use by another script?"
+PORT_HELP = f"servo board serial port (default: the one USB serial device in {', '.join(PORT_GLOBS)})"
+
+
+def default_port():
+    """The servo board's serial port: the only USB serial device present. Exits with
+    the candidates if there are none or several (then pass --port)."""
+    found = sorted({p for g in PORT_GLOBS for p in glob.glob(g)})
+    if len(found) == 1:
+        return found[0]
+    if not found:
+        sys.exit(f"no USB serial device ({', '.join(PORT_GLOBS)}): is the servo board plugged in "
+                 f"and powered{' and attached with usbipd' if sys.platform != 'darwin' else ''}?")
+    sys.exit(f"several USB serial devices, pick one with --port: {', '.join(found)}")
+
+
 NAMES = {1: "shoulder_pan", 2: "shoulder_lift", 3: "elbow_flex",
          4: "wrist_flex", 5: "wrist_roll", 6: "gripper"}
 IDS = {name: sid for sid, name in NAMES.items()}
@@ -25,9 +51,15 @@ ACCELERATION = 41
 GOAL_POSITION = 42
 GOAL_SPEED = 46
 PRESENT_POSITION = 56
+PRESENT_SPEED = 58
 PRESENT_LOAD = 60
 PRESENT_VOLTAGE = 62
 PRESENT_TEMPERATURE = 63
+STATUS = 65
+# read_states(): one sync read of 56..65 (position, speed, load, voltage, temperature, -, status)
+STATE_LEN = STATUS - PRESENT_POSITION + 1
+# Status (65) bits, Feetech STS manual: a set bit = that protection has tripped
+STATUS_BITS = ("voltage", "sensor", "temperature", "current", "angle", "overload")
 
 RETRIES = 2  # extra attempts per bus transaction before raising
 
@@ -46,26 +78,36 @@ JOINT_CAL = {
     "shoulder_lift": (+1, CENTER),
     "elbow_flex": (+1, CENTER),
     "wrist_flex": (+1, CENTER),
-    "wrist_roll": (+1, CENTER),
+    # wrist_roll's Homing_Offset was moved 1731 -> 1542 (2026-10-11, set_homing_offset.py):
+    # its reading is +189 ticks from before, so the URDF zero (was 2048) is now 2237, and the
+    # 0/4095 seam sits inside the wrist's hard stop (see SOFT_LIMITS)
+    "wrist_roll": (+1, CENTER + 189),
 }
 
 
-# Home = base pose (base_pose.py): every arm joint at 2048. Visually checked
-# on hardware (2026-10-09) to match the URDF zero L-pose.
-HOME = {name: CENTER for name in JOINT_CAL}
+# Home = base pose: every arm joint at its URDF zero (JOINT_CAL; 2048 except wrist_roll,
+# whose reading was shifted). Visually checked on hardware (2026-10-09) to match the URDF
+# zero L-pose. (base_pose.py / jog.py keep their own 2048: don't use them on wrist_roll.)
+HOME = {name: zero for name, (_, zero) in JOINT_CAL.items()}
 
-# Soft limits (ticks) from the hand-measured range of motion
-# (calib/ranges_session1.json), applied on top of the EEPROM limits.
-# wrist_roll's travel crosses the 0/4095 seam (2878 -> 4095/0 -> 2645), and
-# position mode can't pass the seam, so it's kept on the side containing
-# home (2048): 0..2645.
+# Soft limits (ticks): the usable range = the hand-measured range of motion
+# (calib/ranges_session1.json) intersected with the EEPROM limits read from the
+# servos (2026-10-09), so the IK (which can't read the bus) plans exactly what
+# feetech_mirror allows. Measured, where EEPROM is narrower: shoulder_lift 815,
+# elbow_flex 3176, wrist_flex 694, gripper 3523.
+# wrist_roll: its hard stop (~27 deg) was measured by hand, torque off (2026-10-11): the
+# travel ends read 993 and 1298 with Homing_Offset 396, i.e. ~333 deg of travel that crossed
+# the 0/4095 seam (position mode can't), so only ~205 deg was usable (calib/ranges_session1
+# .json's arc was wrong about where the stop is). Offset 1542 puts the seam in the middle of
+# the stop. Probed live with block detection (slow, stops at ~30 % load): the travel reads
+# 110..3987 (341 deg; the stop's middle = the seam); kept 25 ticks inside: -185..+152 deg.
 SOFT_LIMITS = {
     "shoulder_pan": (1272, 3000),
-    "shoulder_lift": (815, 3199),
-    "elbow_flex": (944, 3176),
-    "wrist_flex": (694, 3071),
-    "wrist_roll": (0, 2645),
-    "gripper": (2007, 3523),
+    "shoulder_lift": (1067, 3199),
+    "elbow_flex": (944, 2879),
+    "wrist_flex": (833, 3071),
+    "wrist_roll": (135, 3962),
+    "gripper": (2007, 3298),
 }
 
 # Gripper command range (ticks), for feetech_mirror --gripper. Closed jaws read
@@ -82,6 +124,11 @@ def effective_limits(name, eeprom):
     return max(lo, slo), min(hi, shi)
 
 
+def sign_mag(v, bit):
+    """Feetech sign-magnitude register value: the sign is bit `bit`."""
+    return -(v & ((1 << bit) - 1)) if v & (1 << bit) else v
+
+
 def rad_to_ticks(name, rad):
     sign, zero = JOINT_CAL[name]
     return zero + sign * rad * TICKS_PER_REV / (2 * math.pi)
@@ -93,7 +140,8 @@ def ticks_to_rad(name, ticks):
 
 
 class Bus:
-    def __init__(self, port_name):
+    def __init__(self, port_name=None):
+        port_name = port_name or default_port()
         self.port = scs.PortHandler(port_name)
         self.pkt = scs.PacketHandler(0)  # protocol 0 = STS series
         try:
@@ -102,10 +150,11 @@ class Bus:
             print(e)
             opened = False
         if not opened:
-            sys.exit(f"could not open {port_name} (attached via usbipd? chmod 666?)")
+            sys.exit(f"could not open {port_name} ({OPEN_HINT})")
         if not self.port.setBaudRate(BAUD):
             sys.exit(f"could not set baud {BAUD}")
         self.sync = scs.GroupSyncWrite(self.port, self.pkt, GOAL_POSITION, 2)
+        self.sync_read = None  # GroupSyncRead for read_states, built for the ids asked
         self.retries = 0  # transactions that needed a retry (for reporting)
 
     def ping(self, sid):
@@ -117,7 +166,10 @@ class Bus:
         missed status packet (seen while several servos move, presumably a
         supply/USB hiccup) shouldn't abort a run; persistent failure still raises."""
         for attempt in range(RETRIES + 1):
-            out = fn()
+            try:
+                out = fn()
+            except IndexError:  # the SDK on a truncated reply (seen right after EEPROM writes)
+                out = (None, scs.COMM_RX_CORRUPT, 0)
             res = out[1] if isinstance(out, tuple) and len(out) == 3 else out[0]
             if res == scs.COMM_SUCCESS:
                 if attempt:
@@ -145,8 +197,30 @@ class Bus:
         return self.r2(sid, PRESENT_POSITION)
 
     def load(self, sid):
-        v = self.r2(sid, PRESENT_LOAD)  # sign-magnitude, sign in bit 10, 0.1 %
-        return -(v & 0x3FF) if v & 0x400 else v
+        return sign_mag(self.r2(sid, PRESENT_LOAD), 10)  # sign in bit 10, 0.1 %
+
+    def read_states(self, sids):
+        """Position, speed (ticks/s), load (0.1 %) and tripped protections of several
+        servos in one sync read: one bus round trip instead of one per register and
+        servo. Returns {sid: {"pos", "speed", "load", "flags"}}; raises RuntimeError
+        like the single reads."""
+        sids = list(sids)
+        if self.sync_read is None or list(self.sync_read.data_dict) != sids:
+            self.sync_read = scs.GroupSyncRead(self.port, self.pkt, PRESENT_POSITION, STATE_LEN)
+            for sid in sids:
+                self.sync_read.addParam(sid)
+        g = self.sync_read
+        self._retry(f"sync read ids {sids}", lambda: (g.txRxPacket(),))
+        out = {}
+        for sid in sids:
+            if not g.isAvailable(sid, PRESENT_POSITION, STATE_LEN):
+                raise RuntimeError(f"sync read: no data from id {sid}")
+            status = g.getData(sid, STATUS, 1)
+            out[sid] = {"pos": g.getData(sid, PRESENT_POSITION, 2),
+                        "speed": sign_mag(g.getData(sid, PRESENT_SPEED, 2), 15),
+                        "load": sign_mag(g.getData(sid, PRESENT_LOAD, 2), 10),
+                        "flags": [n for i, n in enumerate(STATUS_BITS) if status >> i & 1]}
+        return out
 
     def limits(self, sid):
         """EEPROM Min/Max_Position_Limit (read only). Odd/unset -> full range."""

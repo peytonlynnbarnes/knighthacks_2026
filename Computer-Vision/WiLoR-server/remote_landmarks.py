@@ -21,6 +21,11 @@ MediaPipe num_hands=1) this keeps one per view: the hand overlapping the last on
 handedness; `hand` = right/left keeps only that hand. A view whose hand suddenly
 changes size (x max_size_jump) or jumps (> max_shift hand sizes) vs the last good
 frame is dropped once (the collapsed-hand failure, see wilor_landmarks.py).
+Two hands (hands=2, hand_target_node.py --two-hands): one hand per side and view, split
+by the server's left/right label, each side tracked as above. __call__ returns the main
+hand (right unless hand="left"); self.other = the other side's (px0, px1) or
+(None, None), self.other_fresh = True (it is picked on every answer), like
+wilor_landmarks.py with other_every=1.
 Not available remotely: YOLO confidence (no conf_start hysteresis; triangulation
 gates catch most one-view false positives) and the MANO extras (`last` has R only).
 
@@ -97,7 +102,7 @@ class StereoLandmarks:
     """Remote WiLoR on both views, one hand. hand: 'any', 'right' or 'left' (the user's hand)."""
 
     def __init__(self, url="http://localhost:8000", token=None, hand="any", inflight=4, quality=80,
-                 timeout=3.0, max_size_jump=1.55, max_shift=0.6):
+                 timeout=3.0, max_size_jump=1.55, max_shift=0.6, hands=1):
         self.url, self.token = url, token if token is not None else os.environ.get("WILOR_TOKEN", "")
         if not self.token:
             raise SystemExit("wilor-remote: set WILOR_TOKEN to the server's secret")
@@ -107,6 +112,13 @@ class StereoLandmarks:
         self.good = [None, None]   # per view: last accepted keypoint box
         self.rejected = [0, 0]     # dropped (sudden-change) frames per view
         self.last = [None, None]
+        # two hands: per side, per view (same meaning as track / good above)
+        self.hands = hands
+        self.main = "left" if hand == "left" else "right"
+        self.other_side = "left" if self.main == "right" else "right"
+        self.side_track = {s: [None, None] for s in ("right", "left")}
+        self.side_good = {s: [None, None] for s in ("right", "left")}
+        self.other, self.other_fresh = (None, None), False
         self.sync = Client(url, self.token, timeout)
         try:
             info = self.sync.request("GET", "/health")
@@ -137,6 +149,8 @@ class StereoLandmarks:
 
     # -- one hand per view -------------------------------------------------------
     def pick(self, views):
+        if self.hands == 2:
+            return self.pick_two(views)
         self.last = [None, None]
         if views is None:  # request failed: no hand this pair (the node holds the arm)
             self.track = [None, None]
@@ -165,6 +179,43 @@ class StereoLandmarks:
             out[v] = h["px"]
             self.last[v] = {"box": h["box"], "is_right": is_right, "R": np.asarray(h["R"], dtype=float)}
         return out[0], out[1]
+
+    def pick_two(self, views):
+        """Two hands: one per side (the server's label) and view. Returns the main side's."""
+        self.last = [None, None]
+        self.other_fresh = True
+        out = {"right": [None, None], "left": [None, None]}
+        if views is None:
+            for side in out:
+                self.side_track[side] = [None, None]
+                self.side_good[side] = [None, None]
+            self.other = (None, None)
+            return None, None
+        for v in (0, 1):
+            hs = []
+            for h in views[v]["hands"]:
+                h["px"] = np.asarray(h["points"], dtype=float)
+                if np.isfinite(h["px"]).all():
+                    h["box"] = _box(h["px"])
+                    hs.append(h)
+            for side in ("right", "left"):
+                cand = [h for h in hs if h["is_right"] == (side == "right")]
+                h = self._pick(cand, self.side_track[side][v], None)
+                if h is None:
+                    self.side_track[side][v] = self.side_good[side][v] = None
+                    continue
+                self.side_track[side][v] = {"box": h["box"], "is_right": side == "right"}
+                if self._sudden(self.side_good[side][v], h["box"]):
+                    self.side_good[side][v] = None
+                    self.rejected[v] += 1
+                    continue
+                self.side_good[side][v] = h["box"]
+                out[side][v] = h["px"]
+                if side == self.main:
+                    self.last[v] = {"box": h["box"], "is_right": side == "right",
+                                    "R": np.asarray(h["R"], dtype=float)}
+        self.other = tuple(out[self.other_side])
+        return out[self.main][0], out[self.main][1]
 
     @staticmethod
     def _pick(hands, track, prefer_right):

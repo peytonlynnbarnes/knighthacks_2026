@@ -8,7 +8,7 @@ the vision input (re-acquired hand, bad frame) can't make the target jump.
 
 Orientation (hand rotation from the calibrated neutral, robot axes):
   1. Frames where the palm is turned nearly edge-on to the cameras (where
-     MediaPipe gets noisy, then loses the hand) count less, and the rotation
+     the landmarks get noisy, then the hand is lost) count less, and the rotation
      holds once the palm is past FACING_DEG[0] from facing the cameras.
   2. One-euro filter on the hand rotation (before the gain, so the filter
      sees real hand speed): strong smoothing when still, little when turning.
@@ -26,13 +26,13 @@ first frame back into a permanent offset on every clutch, so rpy drifted
 (simulated: ~10-100 deg after 20 clutches); a turned hand now just rotates
 the gripper back at the slew limit.
 
-Self-test: .venv/bin/python Computer-Vision/common/hand_mapping.py
+Self-test: python Computer-Vision/common/hand_mapping.py
 """
 import math
 
 import numpy as np
 
-from hand3d import matrix_to_rotvec, matrix_to_rpy, rotvec_to_matrix, rpy_to_matrix
+from hand3d import matrix_to_rotvec, matrix_to_rpy, rotvec_to_matrix, rpy_to_matrix, twist_about, twist_x
 
 # offset box around home = mid-workspace (home z = 17.6 cm above base_link).
 # z floor -0.13 = 4.6 cm above base_link: the -0.10 floor left the gripper ~40 mm
@@ -188,19 +188,20 @@ class StereoKalman:
         return self.x[:3].copy(), self.x[3:].copy()
 
 
-# StereoIMM settings, tuned offline on the recordings (scored against a zero-lag
-# reference, kalman_bench.py). vs a single StereoKalman (sigma 4, q 0.001):
-#   smooth:     everything equal or better (drop-out error -17%, sweep -11%), same roughness
-#   responsive: tracking error and overshoot about halved, lag 35 -> 22 ms on reaches,
-#               ~35% more acceleration (roughness) while moving
-# Separate per landmark backend. WiLoR (tuned 2026-10-10 on recordings/wilor/, WiLoR's own
-# frames at its live ~15 Hz, kalman_bench --ref-s 0.25): its noise is higher on a still hand
-# but barely grows with speed, so low, flat noise (speed_k 0) and a very sticky still model.
-# vs the MediaPipe smooth preset on the same WiLoR data:
+# StereoIMM / single StereoKalman settings per landmark backend, tuned offline on the
+# recordings (scored against a zero-lag reference, kalman_bench.py). WiLoR (tuned 2026-10-10
+# on recordings/wilor/, WiLoR's own frames at its live ~15 Hz, kalman_bench --ref-s 0.25): its
+# noise is higher on a still hand but barely grows with speed, so low, flat noise (speed_k 0)
+# and a very sticky still model. vs the earlier MediaPipe smooth preset (sigma 4, ray 8,
+# speed_k 0.005, p_stay 0.8) on the same WiLoR data:
 #   smooth:     tracking error about halved (sweep 5.4 -> 2.7 mm, drop-out 10.1 -> 3.3),
 #               lag 20-56 -> 5-13 ms, still-hand wobble 0.56 -> 0.31 mm
 #   responsive: drop-out error a further -10%, ~5 ms less lag, still wobble 0.40 mm
 IMM_PRESETS = {
+    # MediaPipe (Linux only), vs a single StereoKalman (sigma 4, q 0.001):
+    #   smooth:     everything equal or better (drop-out error -17%, sweep -11%), same roughness
+    #   responsive: tracking error and overshoot about halved, lag 35 -> 22 ms on reaches,
+    #               ~35% more acceleration (roughness) while moving
     "mediapipe": {
         "smooth": dict(sigma_px=4.0, ray_px=8.0, speed_k=0.005, q=(1e-6, 0.01), p_stay=0.8),
         "responsive": dict(sigma_px=2.0, ray_px=4.0, speed_k=0.005, q=(1e-6, 0.01), p_stay=0.8),
@@ -411,6 +412,120 @@ class GripFilter:
         g = min(1.0, max(0.0, (self.open - self.curl) / (self.open - self.closed)))
         self.grip = g if self.grip is None else self.grip + (1.0 - math.exp(-dt / self.tau)) * (g - self.grip)
         return self.grip
+
+
+# Pan geometry (base_link, from the IK's URDF FK, 2026-10-11): the pan axis is 3.9 cm in
+# front of base_link's origin; the IK home tip (offset 0) is at x 0.2914; +pan swings the tip
+# toward -y, so the claw's direction angle is -pan. Pan soft limits -66..+82 deg, minus the
+# IK's 2 deg margin -> direction angle -80..+64 deg.
+PAN_AXIS_X = 0.0388
+HOME_TIP_X = 0.2914
+PAN_DIR_LIMITS_DEG = (-80.0, 64.0)
+
+
+class CylinderMap:
+    """Hand-space offset (m, from HandMapper: x forward, y left, z up) -> IK offset, with
+    the side motion as the base's rotation: y -> the direction angle (deg_at_span at
+    +-span, clipped to the pan range), x -> reach from the pan axis, z unchanged.
+    A box in plain x/y capped the pan at ~+-30 deg (+-15 cm at 19..33 cm reach). Pure."""
+
+    def __init__(self, span=0.20, deg_at_span=75.0, limits=PAN_DIR_LIMITS_DEG,
+                 axis_x=PAN_AXIS_X, home_x=HOME_TIP_X):
+        self.k = math.radians(deg_at_span) / span
+        self.lo, self.hi = (math.radians(v) for v in limits)
+        self.axis_x, self.home_x = axis_x, home_x
+
+    def __call__(self, off):
+        x, y, z = off
+        r = self.home_x - self.axis_x + x
+        th = min(self.hi, max(self.lo, self.k * y))
+        return np.array([self.axis_x + r * math.cos(th) - self.home_x, r * math.sin(th), z])
+
+
+class RollFilter:
+    """Left-hand twist -> steady wrist_roll command (rad). Pure, no ROS. Two-hand mode
+    (TWO_HAND_PLAN.md); ported from Second-Hand-Controls-Wrist (ba9e37a).
+
+    Relative: the twist since the hand was anchored (when it appeared) is added to the
+    roll at that moment. The twist is about `axis` (unit vector in the frame of R, e.g.
+    the robot's forward axis in camera coords: with the palm facing the cameras a
+    doorknob turn is about the palm normal, and the finger axis saw only ~16 % of it,
+    measured 2026-10-10), or about the hand's own finger axis if axis is None. Then, per frame:
+      - fingers opening/closing (curl speed > curl_rate per s): re-anchor every frame,
+        so gripping can't twist the wrist
+      - palm edge-on (> edge_deg from facing the cameras): hold, the twist is unreliable
+      - a jump > jump rad from the last accepted value: ignored unless `confirm`
+        consecutive frames agree (one-frame glitches)
+      - one-euro smoothing, then at most max_speed rad/s, clipped to [lo, hi]
+        (wrist_roll's soft limits, -157..+50 deg; it can't cross the 0/4095 seam)
+    update() returns (command, state), state in track / anchor / grip / edge / jump;
+    call lost(t) on frames without the hand (hidden >= reanchor_s: re-anchor on return).
+    """
+
+    def __init__(self, sign=1.0, scale=1.0, lo=-2.70, hi=0.85, max_speed=math.radians(90),
+                 jump=math.radians(35), confirm=3, curl_rate=0.8, edge_deg=FACING_DEG[0],
+                 reanchor_s=0.3, filt=(1.5, 0.5), start=0.0, axis=None, neutral=None, center=None):
+        """neutral: absolute mode. The twist is always measured from this hand rotation
+        (the calibration's neutral) and added to `center` (default: the middle of lo..hi);
+        no re-anchoring, so the same hand angle always gives the same roll, and gripping /
+        a hidden hand only hold it."""
+        self.sign, self.scale, self.lo, self.hi = sign, scale, lo, hi
+        self.axis = None if axis is None else np.asarray(axis, float) / np.linalg.norm(axis)
+        # max_speed and jump are for the hand's turn: a gain > 1 scales them with it, so a
+        # quick turn isn't capped or taken for a glitch
+        g = max(1.0, abs(scale))
+        self.max_speed, self.jump, self.confirm = max_speed * g, jump * g, confirm
+        self.curl_rate, self.edge_deg, self.reanchor_s = curl_rate, edge_deg, reanchor_s
+        self.f = OneEuro(*filt)
+        self.cmd = self.raw = self.base = float(start)
+        self.anchor = self.lost_since = self.t = self.curl = self.pending = None
+        self.absolute = neutral is not None
+        if self.absolute:
+            self.anchor = np.asarray(neutral, float)
+            self.base = self.raw = 0.5 * (lo + hi) if center is None else float(center)
+        self.curl_v, self.n = 0.0, 0
+
+    def lost(self, t):
+        if self.lost_since is None:
+            self.lost_since = t
+
+    def update(self, R, curl, palm_deg, t):
+        """R: hand rotation (any fixed frame), curl: finger curl or None, palm_deg: angle
+        between the palm normal and the view ray (hand_mapping.facing_weight)."""
+        dt = 0.0 if self.t is None else min(max(0.0, t - self.t), HandMapper.MAX_DT)
+        self.t = t
+        if curl is not None and self.curl is not None and dt > 0:
+            # peak-hold with decay: reacts on the first frame the fingers move
+            self.curl_v = max(abs(curl - self.curl) / dt, 0.5 * self.curl_v)
+        if curl is not None:
+            self.curl = curl
+        hidden = self.lost_since is not None and t - self.lost_since >= self.reanchor_s
+        self.lost_since = None
+        gripping = self.curl_v > self.curl_rate
+        if self.absolute and gripping:
+            state = "grip"  # fingers moving: hold (the twist reads wrong while they move)
+        elif not self.absolute and (self.anchor is None or hidden or gripping):
+            self.anchor, self.base, self.pending = R, self.raw, None
+            state = "grip" if gripping else "anchor"
+        elif palm_deg > self.edge_deg:
+            state = "edge"
+        else:
+            tw = twist_x(self.anchor.T @ R) if self.axis is None else twist_about(R @ self.anchor.T, self.axis)
+            cand = min(self.hi, max(self.lo, self.base + self.sign * self.scale * tw))
+            state = "track"
+            if abs(cand - self.raw) <= self.jump:
+                self.raw, self.pending = cand, None
+            else:
+                self.n = self.n + 1 if self.pending is not None and abs(cand - self.pending) <= self.jump / 2 else 1
+                self.pending = cand
+                if self.n >= self.confirm:
+                    self.raw, self.pending = cand, None
+                else:
+                    state = "jump"
+        target = float(self.f(np.array([self.raw]), t)[0])
+        lim = self.max_speed * dt
+        self.cmd = min(self.hi, max(self.lo, self.cmd + min(lim, max(-lim, target - self.cmd))))
+        return self.cmd, state
 
 
 class HandMapper:
@@ -637,7 +752,7 @@ def _selftest():
             imm(pk, k / 30)
         xs = [imm(pk + [0.1, 0, 0], k / 30)[0][0] for k in range(30, 60)]
         # WiLoR's low noise settings overshoot this instant 10 cm step by ~12 mm (on its real
-        # reaches they overshoot less than the MediaPipe presets: 4.6 vs 7.2 mm)
+        # reaches they overshoot less than the old MediaPipe presets did: 4.6 vs 7.2 mm)
         max_ov = 0.11 if backend == "mediapipe" else 0.115
         assert abs(xs[5] - 0.1) < 0.01 and max(xs) < max_ov and abs(xs[-1] - 0.1) < 0.002, (preset, xs)
     # StillHold: freezes a still hand, releases on motion without a step
@@ -663,6 +778,70 @@ def _selftest():
         g = gf(1.05, 30.0, k / 16)
     assert g < 0.01, g
     assert GripFilter(1.0, 0.75)(None, 0.0, 0.0) is None  # no curl yet
+    # RollFilter (two-hand mode): twist about the hand's x (finger) axis, ~10 fps
+    rpy = rpy_to_matrix
+    rf, t = RollFilter(lo=-3.0, hi=3.0), 0.0
+    rf.update(np.eye(3), 1.0, 0.0, t)  # anchors at roll 0
+    for k in range(1, 31):  # twist to 60 deg over 1 s, then hold 2 s
+        t += 0.1
+        out, st = rf.update(rpy(math.radians(min(60, 6 * k)), 0, 0), 1.0, 0.0, t)
+    assert abs(math.degrees(out) - 60) < 2 and st == "track", (math.degrees(out), st)
+    t += 0.1  # one-frame glitch +80 deg: ignored
+    out, st = rf.update(rpy(math.radians(140), 0, 0), 1.0, 0.0, t)
+    assert st == "jump" and abs(math.degrees(out) - 60) < 2, (math.degrees(out), st)
+    for k in range(5):  # fingers closing fast while the twist estimate drifts 40 deg: no roll
+        t += 0.1
+        out, st = rf.update(rpy(math.radians(60 + 8 * k), 0, 0), 1.0 - 0.1 * k, 0.0, t)
+    assert st == "grip" and abs(math.degrees(out) - 60) < 2, (math.degrees(out), st)
+    for _ in range(10):  # fingers still again at the drifted pose: stays put (re-anchored)
+        t += 0.1
+        out, st = rf.update(rpy(math.radians(92), 0, 0), 0.6, 0.0, t)
+    assert abs(math.degrees(out) - 60) < 2, math.degrees(out)
+    t += 0.1  # palm edge-on: hold
+    out, st = rf.update(rpy(math.radians(120), 0, 0), 0.6, 85.0, t)
+    assert st == "edge" and abs(math.degrees(out) - 60) < 2
+    rf.lost(t + 0.1)  # hidden 0.5 s, back at another twist: re-anchors, no jump
+    out, st = rf.update(rpy(math.radians(-30), 0, 0), 0.6, 0.0, t + 0.6)
+    assert st == "anchor" and abs(math.degrees(out) - 60) < 2, (math.degrees(out), st)
+    rf2, t2 = RollFilter(max_speed=math.radians(90)), 0.0  # speed limit: 0.5 s for at most 45 deg
+    rf2.update(np.eye(3), 1.0, 0.0, t2)
+    for k in range(5):
+        t2 += 0.1
+        out, _ = rf2.update(rpy(math.radians(-30), 0, 0), 1.0, 0.0, t2)
+    assert abs(math.degrees(out)) <= 45 + 1e-6, math.degrees(out)
+    # fixed axis (camera frame): a turn about the palm normal / robot forward counts fully,
+    # a tilt about another axis doesn't
+    fwd = np.array([0.0, 0.0, -1.0])  # e.g. robot forward = toward the cameras
+    rf4, t4 = RollFilter(axis=fwd, lo=-3.0, hi=3.0), 0.0
+    R0 = rpy(0.3, -0.2, 0.1)
+    rf4.update(R0, 1.0, 0.0, t4)
+    for k in range(1, 31):
+        t4 += 0.1
+        out, _ = rf4.update(rotvec_to_matrix(fwd * math.radians(min(60, 6 * k))) @ R0, 1.0, 0.0, t4)
+    assert abs(math.degrees(out) - 60) < 2, math.degrees(out)
+    for k in range(1, 31):  # tilt about a perpendicular axis: the roll stays
+        t4 += 0.1
+        out, _ = rf4.update(rotvec_to_matrix(np.array([1.0, 0, 0]) * math.radians(min(40, 4 * k)))
+                            @ rotvec_to_matrix(fwd * math.radians(60)) @ R0, 1.0, 0.0, t4)
+    assert abs(math.degrees(out) - 60) < 3, math.degrees(out)
+    rf3, t3 = RollFilter(), 0.0  # clipped to the soft limits, never past the +50 deg side
+    rf3.update(np.eye(3), 1.0, 0.0, t3)
+    for k in range(1, 40):
+        t3 += 0.1
+        out, _ = rf3.update(rpy(math.radians(min(90, 5 * k)), 0, 0), 1.0, 0.0, t3)
+    assert out <= 0.85 + 1e-9, math.degrees(out)
+    # cylinder map: home stays home; +-span -> +-75 deg about the pan axis (clipped to the
+    # pan range); near the middle 1 cm of hand ~ r * k cm of tip; reach and height pass
+    cm = CylinderMap(span=0.20, deg_at_span=75.0)
+    assert np.allclose(cm(np.zeros(3)), 0)
+    r0 = HOME_TIP_X - PAN_AXIS_X
+    for y, want in ((0.20, 64.0), (-0.20, -75.0), (0.10, 37.5), (-0.30, -80.0)):
+        p = cm(np.array([0.0, y, 0.0])) + [HOME_TIP_X, 0, 0]
+        ang = math.degrees(math.atan2(p[1], p[0] - PAN_AXIS_X))
+        assert abs(ang - want) < 1e-6 and abs(math.hypot(p[0] - PAN_AXIS_X, p[1]) - r0) < 1e-9, (y, ang)
+    d = cm(np.array([0.0, 0.001, 0.0]))[1] / 0.001
+    assert abs(d - r0 * math.radians(75) / 0.20) < 0.01, d
+    assert np.allclose(cm(np.array([0.05, 0.0, -0.03])), [0.05, 0.0, -0.03])
     print("hand_mapping self-test OK")
 
 

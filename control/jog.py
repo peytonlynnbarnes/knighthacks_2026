@@ -25,6 +25,8 @@ import time
 
 import scservo_sdk as scs
 
+from so101_bus import OPEN_HINT, PORT_HELP, default_port
+
 BAUD = 1_000_000
 NAMES = {1: "shoulder_pan", 2: "shoulder_lift", 3: "elbow_flex",
          4: "wrist_flex", 5: "wrist_roll", 6: "gripper"}
@@ -54,7 +56,7 @@ class Arm:
         self.port = scs.PortHandler(port_name)
         self.pkt = scs.PacketHandler(0)
         if not self.port.openPort():
-            raise SystemExit(f"could not open {port_name} (attached via usbipd? chmod 666?)")
+            raise SystemExit(f"could not open {port_name} ({OPEN_HINT})")
         if not self.port.setBaudRate(BAUD):
             raise SystemExit(f"could not set baud {BAUD}")
         self.joints = {}
@@ -242,8 +244,9 @@ def run(scr, arm):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=None, help=PORT_HELP)
     args = ap.parse_args()
+    args.port = args.port or default_port()
     arm = Arm(args.port)
     try:
         curses.wrapper(run, arm)

@@ -5,7 +5,7 @@ Times, per call, what the stereo backend will do every frame: one WiLoR forward
 pass on a batch of crops (2 = one hand in both views), and YOLO hand detection
 at 320 px on one view (run every few frames). Inputs are the repo's demo images.
 
-    Computer-Vision/WiLoR/.venv/bin/python Computer-Vision/WiLoR/bench_wilor.py [--fp32] [--n 50]
+    python Computer-Vision/WiLoR/bench_wilor.py [--fp32] [--n 50]
 """
 import argparse
 import glob
@@ -43,34 +43,21 @@ def main():
     ap.add_argument("--compile", action="store_true", help="torch.compile the model first")
     args = ap.parse_args()
 
-    import ultralytics.nn.tasks
-    from ultralytics import YOLO
-    from wilor.models import load_wilor
+    from wilor_landmarks import CROP, load_models
 
-    dev = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float32 if (args.fp32 or dev.type == "cpu") else torch.float16
-    torch.backends.cudnn.benchmark = True
-    torch.serialization.add_safe_globals([ultralytics.nn.tasks.PoseModel])
-    cwd = os.getcwd()
-    os.chdir(REPO)  # load_wilor hardcodes ./mano_data/
-    try:
-        model, cfg = load_wilor(checkpoint_path="./pretrained_models/wilor_final.ckpt",
-                                cfg_path="./pretrained_models/model_config.yaml")
-        detector = YOLO("./pretrained_models/detector.pt").to(dev)
-    finally:
-        os.chdir(cwd)
-    model = model.to(device=dev, dtype=dtype).eval()
+    # same loader as the node (device choice, dtype, MPS contiguity fix)
+    model, detector, dev, dtype = load_models(fp32=args.fp32)
     if args.compile:
         model = torch.compile(model)
-    size = cfg.MODEL.IMAGE_SIZE
-    print(f"device {dev} ({torch.cuda.get_device_name() if dev.type == 'cuda' else 'cpu'}), {dtype}, "
-          f"image size {size}")
+    size = CROP
+    name = {"cuda": lambda: torch.cuda.get_device_name(), "mps": lambda: "Apple GPU"}.get(dev.type, lambda: "cpu")()
+    print(f"device {dev} ({name}), {dtype}, image size {size}")
 
     imgs = [cv2.imread(p) for p in sorted(glob.glob(os.path.join(REPO, "demo_img", "*")))]
     imgs = [cv2.resize(i, (640, 480)) for i in imgs if i is not None]
     mean = torch.tensor([0.485, 0.456, 0.406], device=dev, dtype=dtype).view(1, 3, 1, 1)
     std = torch.tensor([0.229, 0.224, 0.225], device=dev, dtype=dtype).view(1, 3, 1, 1)
-    sync = torch.cuda.synchronize if dev.type == "cuda" else (lambda: None)
+    sync = {"cuda": torch.cuda.synchronize, "mps": torch.mps.synchronize}.get(dev.type, lambda: None)
 
     def batch(k):
         crops = [cv2.cvtColor(cv2.resize(imgs[i % len(imgs)], (size, size)), cv2.COLOR_BGR2RGB)
@@ -87,9 +74,12 @@ def main():
                 out["pred_keypoints_2d"].float().cpu()
             print(f"WiLoR batch {k}: {timed(run, args.n, sync)}")
         small = cv2.resize(imgs[0], (320, 240))
-        print(f"YOLO 320 px  : {timed(lambda: detector(small, verbose=False, conf=0.3, imgsz=320), args.n, sync)}")
+        print(f"YOLO 320 px  : "
+              f"{timed(lambda: detector(small, verbose=False, conf=0.3, imgsz=320, device=dev), args.n, sync)}")
     if dev.type == "cuda":
         print(f"peak VRAM {torch.cuda.max_memory_allocated() / 2**20:.0f} MiB")
+    elif dev.type == "mps":
+        print(f"MPS memory {torch.mps.driver_allocated_memory() / 2**20:.0f} MiB")
 
 
 if __name__ == "__main__":

@@ -11,6 +11,8 @@ import sys
 
 import scservo_sdk as scs
 
+from so101_bus import PORT_HELP, default_port
+
 BAUD = 1_000_000
 NAMES = {1: "shoulder_pan", 2: "shoulder_lift", 3: "elbow_flex",
          4: "wrist_flex", 5: "wrist_roll", 6: "gripper"}
@@ -19,10 +21,11 @@ TORQUE_ENABLE = 40
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", default="/dev/ttyACM0")
+    ap.add_argument("--port", default=None, help=PORT_HELP)
     ap.add_argument("--joints", type=int, nargs="+", default=list(NAMES))
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt")
     args = ap.parse_args()
+    args.port = args.port or default_port()
 
     names = ", ".join(NAMES.get(j, str(j)) for j in args.joints)
     if not args.yes:

@@ -67,14 +67,20 @@ def hardware_limits(path=HW_LIMITS_FILE):
     return out
 
 
-def apply_limits(chain, limits, margin=np.radians(2.0)):
+# Joints whose URDF limit is only a model choice: the measured range replaces it. wrist_roll's
+# URDF says +-157 deg; the real one turns ~340 deg (so101_bus SOFT_LIMITS).
+REPLACE_URDF_LIMITS = ("wrist_roll",)
+
+
+def apply_limits(chain, limits, margin=np.radians(2.0), replace=REPLACE_URDF_LIMITS):
     """Narrow the chain's joint limits to their intersection with `limits`
-    ({joint: (lo, hi) rad}), minus a margin. Returns {joint: (lo, hi)} changed."""
+    ({joint: (lo, hi) rad}), minus a margin; joints in `replace` take `limits` as is
+    (minus the margin). Returns {joint: (lo, hi)} changed."""
     changed = {}
     for i, name in enumerate(chain.active):
         if name in limits:
-            lo = max(chain.lower[i], limits[name][0] + margin)
-            hi = min(chain.upper[i], limits[name][1] - margin)
+            lo = limits[name][0] + margin if name in replace else max(chain.lower[i], limits[name][0] + margin)
+            hi = limits[name][1] - margin if name in replace else min(chain.upper[i], limits[name][1] - margin)
             if (lo, hi) != (chain.lower[i], chain.upper[i]) and lo < hi:
                 chain.lower[i], chain.upper[i] = lo, hi
                 changed[name] = (lo, hi)
