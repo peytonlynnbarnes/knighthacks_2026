@@ -58,7 +58,8 @@ Parameters:
                      normal gap between targets. 0 = latest target, as is.
                      With interp_auto_max > 0 this is the minimum
     interp_auto_max  > 0: the delay follows the target rate (0.9 x the median
-                     recent gap, at most this, s); 0 = fixed interp_delay
+                     recent gap, at most this, s); 0 (default) = fixed interp_delay
+                     (the auto delay added ~50 ms of lag in two-hand mode)
     smooth_tau       extra time-based smoothing of the target (s), 0 = off
                      (smoothing belongs in the CV node; this replaced the
                      per-message EMA `alpha`, which smoothed more at higher fps)
@@ -95,7 +96,7 @@ class IKNode(Node):
         self.declare_parameter("solve_budget_s", 0.02)
         self.declare_parameter("hw_limits_file", HW_LIMITS_FILE)
         self.declare_parameter("interp_delay", 0.04)
-        self.declare_parameter("interp_auto_max", 0.12)
+        self.declare_parameter("interp_auto_max", 0.0)
         self.declare_parameter("smooth_tau", 0.0)
         self.declare_parameter("max_pos_err", 0.01)
         self.declare_parameter("rate", 30.0)

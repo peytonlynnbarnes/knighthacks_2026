@@ -199,7 +199,7 @@ def main():
     ap.add_argument("--yes", action="store_true", help="skip the confirmation prompt (with --live)")
     ap.add_argument("--no-bus", action="store_true", help="dry run without the arm attached")
     ap.add_argument("--rate", type=float, default=50.0, help="control loop Hz")
-    ap.add_argument("--alpha", type=float, default=0.3, help="EMA factor on targets (0..1]")
+    ap.add_argument("--alpha", type=float, default=0.6, help="EMA factor on targets (0..1]; lower = smoother, more lag")
     ap.add_argument("--max-speed", type=float, default=DEFAULT_SPEED,
                     help=f"per-joint goal rate limit, ticks/s (default {DEFAULT_SPEED} = 75%% of "
                          f"full speed, max {MAX_SPEED_CAP})")

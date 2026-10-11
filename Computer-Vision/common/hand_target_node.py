@@ -308,7 +308,7 @@ def main():
     ap.add_argument("--z-min", type=float, default=float(BOX_MIN[2]),
                     help="lowest arm offset below home (m); the table guard. Lower it in "
                          "small steps (home is 17.6 cm above base_link)")
-    ap.add_argument("--max-lin", type=float, default=0.25, help="target speed limit (m/s)")
+    ap.add_argument("--max-lin", type=float, default=1.0, help="target speed limit (m/s); 0.25 = old, smoother but ~200 ms more lag")
     ap.add_argument("--max-ang", type=float, default=360.0,
                     help="target rotation speed limit (deg/s, gripper; gains make it turn faster "
                          "than the hand)")
