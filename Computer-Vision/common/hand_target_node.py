@@ -520,8 +520,10 @@ def main():
     ap.add_argument("--two-hands", action="store_true",
                     help="right hand = position + pitch, left hand = wrist_roll (/wrist_roll_cmd) + "
                          "gripper (TWO_HAND_PLAN.md); after the right-hand calibration, 2 left-hand steps")
-    ap.add_argument("--roll-sign", type=float, default=1.0, choices=[1.0, -1.0],
-                    help="two hands: -1 if wrist_roll turns the opposite way to the left hand")
+    ap.add_argument("--roll-sign", type=float, default=-1.0, choices=[1.0, -1.0],
+                    help="two hands: which way wrist_roll turns for a left-hand twist (default -1: a "
+                         "clockwise hand turn = a clockwise wrist turn, checked on the arm 2026-10-11; "
+                         "1 = the other way)")
     args = ap.parse_args()
     ui = None
     if args.ui_port is not None:  # the app window shows the preview; it owns the Dock icon
@@ -686,7 +688,8 @@ def main():
         grip_open = max(grip_open, args.grip_closed_curl + 0.15)
         old_roll = roll_f.cmd if roll_f is not None else 0.0
         # a clockwise hand turn = gripper roll + (as one-handed) = wrist_roll - (tool roll =
-        # -wrist_roll, ik_solver.roll_sign); --roll-sign -1 flips it if the arm disagrees
+        # -wrist_roll, ik_solver.roll_sign) by that sign alone; the arm turned the other way, so
+        # --roll-sign defaults to -1 (2026-10-11)
         # gain: the calibration asked for a quarter turn and measured roll_deg of twist about
         # the robot's forward axis; a hand turning about a tilted axis shows only part of it
         # (90 deg read as ~45 on 2026-10-11), so the wrist turned half as far as the hand
