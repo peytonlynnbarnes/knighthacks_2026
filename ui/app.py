@@ -8,25 +8,35 @@
     python ui/app.py -- --timing     # anything after -- goes to hand_target_node.py
     q / Esc quits (stops everything first).
 
-Start runs the IK node, feetech_mirror.py (--gripper, live unless --dry-run) and
-hand_target_node.py (two hands; the saved hand calibration if there is one, else the
-calibration steps show in the status card). Stop ends all three (the arm holds its
-pose). Calibrate redoes the hand calibration (starting everything if stopped). Torque
+One Start / Stop button. Start (idle) runs the IK node, feetech_mirror.py (--gripper,
+live unless --dry-run) and hand_target_node.py (two hands; the saved hand calibration
+if there is one, else the calibration steps show in the status bar); the button then
+turns into Stop, which ends all three (the arm holds its pose). Calibrate redoes the hand calibration (starting everything if stopped). Torque
 Off makes the arm go limp and DROP: click it twice within a few seconds (support the
 arm first); it stops everything, and Start homes the arm again. The
 camera box shows the hand node's preview: both cameras side by side, the right hand
 green, the left orange, the palm axes. See pipeline.py.
 
-Layout: the camera box keeps the preview's aspect ratio, the buttons sit centered
-below it, the app name in the top margin, vines hang from both top corners.
+Look: an enchanted forest at night (the hackathon theme: purples and greens). Deep plum
+sky, a lilac glow behind the camera card; the original vines from the top corners
+(vines.py) over pixel-art scenery (forest.py): mushrooms bottom left, flowers bottom
+right, stars, fireflies, trunks at the edges.
+Cinzel Decorative for the name, Nunito for the rest (fixed-width digits in readouts); both
+bundled in ui/fonts (OFL). --contrast prints the text contrast ratios.
+
+Layout: the logo + name in the top margin; the camera card (preview, keeping its aspect
+ratio, with the status bar attached under it: state, readout, arm driver, process dots,
+LIVE / DRY RUN) and the button row centered below: Start/Stop, Calibrate, and Torque
+Off apart, in red.
 """
 import argparse
-import math
 import os
 import random
 import signal
 import sys
+import time
 
+import forest
 from pipeline import Pipeline
 
 HERE = os.path.dirname(os.path.abspath(__file__))
@@ -47,36 +57,44 @@ if os.path.isdir(_plugins):
 
 from PySide6.QtCore import QPointF, QRectF, Qt, QTimer  # noqa: E402
 from PySide6.QtGui import (QColor, QFont, QFontDatabase, QFontMetricsF, QIcon, QImage,  # noqa: E402
-                           QLinearGradient, QPainter, QPainterPath, QPen, QPixmap)
+                           QLinearGradient, QPainter, QPainterPath, QPen, QPixmap, QRadialGradient)
 from PySide6.QtWidgets import QAbstractButton, QApplication, QWidget  # noqa: E402
 
 APP_NAME = "Mimisis"
-FONT_PATH = os.path.join(HERE, "fonts", "Comfortaa-Bold.otf")
+FONT_PATH = os.path.join(HERE, "fonts", "CinzelDecorative-Bold.ttf")  # the name only
+UI_FONT_PATH = os.path.join(HERE, "fonts", "Nunito-Variable.ttf")  # everything else
 LOGO_PATH = os.path.join(HERE, "logo.png")  # white with green vines (title, window + Dock icon)
 
-LILAC_TOP = QColor("#9069C2")     # darker lilac
-LILAC_MID = QColor("#C6ABEA")
-LILAC_BOTTOM = QColor("#FBF8FF")  # very, very light purple
-GRASS = QColor("#8FCF68")         # Start button, vine leaves
-GRASS_DARK = QColor("#6BB247")    # darker leaves
-STEM = QColor("#4F8D36")          # vine stems and leaf veins
+# Enchanted forest at night (the hackathon theme: purples and greens). Text/fill pairs
+# are >= 4.5:1 contrast (python ui/app.py --contrast prints them).
+NIGHT_TOP = QColor("#140A23")     # background gradient, top to bottom
+NIGHT_MID = QColor("#2B1747")
+NIGHT_BOTTOM = QColor("#190D2C")
+GLOW = QColor(160, 115, 225, 70)  # moonlight behind the camera card
+CARD = QColor("#221338")          # camera card / status bar
+CARD_EDGE = QColor(198, 171, 234, 110)
+TEXT = QColor("#F5EFFF")
+MUTED = QColor("#C2B2DF")         # secondary text
+LILAC = QColor("#C6ABEA")         # outline button, calibrating
+PLUM = QColor("#6A4699")          # Stop button
+GRASS = QColor("#8FCF68")         # Start button, tracking, vine leaves
+MOSS = QColor("#10230A")          # text on GRASS
+EMBER = QColor("#C73A55")         # danger: Torque Off, errors, LIVE
+FIREFLY = QColor("#F4C95D")       # warnings: hand lost, confirm, DRY RUN
+FIREFLY_TEXT = QColor("#2A1A00")  # text on FIREFLY
 WHITE = QColor("#FFFFFF")
-SHADOW = QColor(58, 28, 104)      # purple-tinted drop shadow
-LILAC_DARK = QColor("#7E57B5")    # Calibrate button
-ROSE = QColor("#D9708F")          # Stop button
-BRICK = QColor("#C2453D")         # Torque Off button
-STATUS_BG = {"calib": QColor(58, 28, 104, 190),   # calibration step instructions
-             "hold": QColor(58, 28, 104, 190),    # no hand yet
-             "lost": QColor(58, 28, 104, 190),    # hand lost, arm holding
-             "info": QColor(58, 28, 104, 190),    # starting / loading
-             "track": QColor(83, 150, 52, 225),   # publishing to the arm
-             "error": QColor(150, 48, 92, 220)}
-ALARM_BG = QColor(170, 30, 40, 230)
+SHADOW = QColor(6, 2, 14)
+KIND_COLOR = {"calib": LILAC, "hold": MUTED, "lost": FIREFLY, "info": LILAC, "track": GRASS, "error": EMBER}
+KIND_LABEL = {"idle": "Idle", "starting": "Starting…", "running": "Waiting for a hand", "stopping": "Stopping…"}
 
 # Base sizes at a 1400 x 820 window; everything scales from these.
-BUTTON_SIZE = (230, 64)
-BUTTON_GAP = 36
+BUTTON_SIZE = (220, 60)
+BUTTON_GAP = 40          # even gaps: the row is symmetric about the window's center
+STATUS_H = 58            # status bar under the camera
+STACK_GAP = 30           # status bar -> buttons
+BOTTOM_MARGIN = 30
 TORQUE_CONFIRM_MS = 4000  # Torque Off: the second click must come within this
+RUN_SWITCH_GUARD_S = 0.5  # Start/Stop ignores clicks this long after it switched
 TORQUE_WARNING = "Click Torque Off again to drop the arm"
 PREVIEW_ASPECT = 32 / 9  # two 16:9 views side by side, until the first frame says otherwise
 
@@ -85,14 +103,57 @@ HAND_ARGS = ["--cams", "1", "0", "--two-hands", "--z-min", "-0.16", "--grip-clos
 ARM_ARGS = ["--gripper", "--max-speed", "800", "--lift-speed", "450"]
 
 
-def app_font(px):
-    f = QFont(app_font.family)
+def brand_font(px):
+    """Cinzel Decorative: the app name."""
+    f = QFont(brand_font.family)
     f.setBold(True)
     f.setPixelSize(max(1, round(px)))
     return f
 
 
-app_font.family = "Comfortaa"
+def app_font(px, weight=QFont.Bold, digits=False):
+    """Nunito: buttons and text. digits=True: fixed-width figures (readouts don't jitter)."""
+    f = QFont(app_font.family)
+    f.setWeight(weight)
+    f.setPixelSize(max(1, round(px)))
+    if digits:
+        f.setFeature(QFont.Tag("tnum"), 1)
+    return f
+
+
+brand_font.family = "Cinzel Decorative"
+app_font.family = "Nunito"
+
+
+def load_fonts():
+    """Register the bundled fonts (after the QApplication exists); system font if one fails."""
+    for path, fn in ((FONT_PATH, brand_font), (UI_FONT_PATH, app_font)):
+        fid = QFontDatabase.addApplicationFont(path)
+        if fid >= 0:
+            fn.family = QFontDatabase.applicationFontFamilies(fid)[0]
+        else:
+            print(f"warning: couldn't load {path}; using the system font", file=sys.stderr)
+
+
+def with_alpha(c, a):
+    c = QColor(c)
+    c.setAlphaF(a)
+    return c
+
+
+def contrast(fg, bg):
+    """WCAG contrast ratio of two opaque colors."""
+    def lum(c):
+        ch = [x / 255 for x in (c.red(), c.green(), c.blue())]
+        ch = [x / 12.92 if x <= 0.03928 else ((x + 0.055) / 1.055) ** 2.4 for x in ch]
+        return 0.2126 * ch[0] + 0.7152 * ch[1] + 0.0722 * ch[2]
+    a, b = sorted((lum(fg), lum(bg)), reverse=True)
+    return (a + 0.05) / (b + 0.05)
+
+
+CONTRAST_PAIRS = [("text on card", TEXT, CARD), ("muted on card", MUTED, CARD), ("text on night", TEXT, NIGHT_MID),
+                  ("Start", MOSS, GRASS), ("Stop", WHITE, PLUM), ("Calibrate", LILAC, NIGHT_MID),
+                  ("Torque Off", WHITE, EMBER), ("Confirm?", FIREFLY_TEXT, FIREFLY)]
 
 
 def soft_shadow(p, rect, radius, spread, alpha=0.30, dy=0.0, steps=10):
@@ -106,50 +167,112 @@ def soft_shadow(p, rect, radius, spread, alpha=0.30, dy=0.0, steps=10):
     p.setPen(Qt.NoPen)
     for i in range(steps):
         g = spread * (i + 1) / steps
-        c = QColor(SHADOW)
-        c.setAlphaF(alpha / steps)
-        p.setBrush(c)
+        p.setBrush(with_alpha(SHADOW, alpha / steps))
         p.drawRoundedRect(rect.adjusted(-g, -g + dy, g, g + dy), radius + g, radius + g)
     p.restore()
 
 
-class RoundedButton(QAbstractButton):
-    """Green rounded-square button with a white outline and white label."""
+def draw_icon(p, kind, r, color, width):
+    """Line icons in the square `r`: play, stop, target, power."""
+    p.save()
+    pen = QPen(color, width, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin)
+    c, k = r.center(), r.width() / 2
+    if kind == "play":
+        path = QPainterPath(QPointF(c.x() - 0.55 * k, c.y() - 0.75 * k))
+        path.lineTo(c.x() + 0.8 * k, c.y())
+        path.lineTo(c.x() - 0.55 * k, c.y() + 0.75 * k)
+        path.closeSubpath()
+        p.setPen(pen)
+        p.setBrush(color)
+        p.drawPath(path)
+    elif kind == "stop":
+        p.setPen(pen)
+        p.setBrush(color)
+        p.drawRoundedRect(QRectF(c.x() - 0.62 * k, c.y() - 0.62 * k, 1.24 * k, 1.24 * k), 0.2 * k, 0.2 * k)
+    elif kind == "target":
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        p.drawEllipse(c, 0.62 * k, 0.62 * k)
+        for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            p.drawLine(QPointF(c.x() + 0.62 * k * dx, c.y() + 0.62 * k * dy),
+                       QPointF(c.x() + 1.0 * k * dx, c.y() + 1.0 * k * dy))
+        p.setBrush(color)
+        p.drawEllipse(c, 0.14 * k, 0.14 * k)
+    elif kind == "power":
+        p.setPen(pen)
+        p.setBrush(Qt.NoBrush)
+        ring = QRectF(c.x() - 0.78 * k, c.y() - 0.7 * k, 1.56 * k, 1.56 * k)
+        p.drawArc(ring, 120 * 16, -240 * 16)  # open at the top
+        p.drawLine(QPointF(c.x(), c.y() - 1.0 * k), QPointF(c.x(), c.y() + 0.05 * k))
+    p.restore()
 
-    def __init__(self, text, color, parent=None):
+
+class ForestButton(QAbstractButton):
+    """Rounded button with an icon. role: "primary" (green), "neutral" (plum),
+    "outline" (lilac edge) or "danger" (ember); `armed` (Torque Off waiting for its
+    second click) turns it firefly amber with a countdown ring (progress 1 -> 0)."""
+
+    STYLE = {"primary": (GRASS, MOSS), "neutral": (PLUM, WHITE), "outline": (None, LILAC),
+             "danger": (EMBER, WHITE)}
+
+    def __init__(self, text, icon, role, parent=None):
         super().__init__(parent)
         self.setText(text)
-        self.color = QColor(color)
-        self.scale = 1.0
+        self.icon, self.role = icon, role
+        self.scale, self.armed, self.progress = 1.0, False, 0.0
         self.setCursor(Qt.PointingHandCursor)
-        self.setAttribute(Qt.WA_Hover)  # repaint on hover enter/leave
+        self.setFocusPolicy(Qt.TabFocus)  # keyboard focus only: a click doesn't leave a ring
+        self.setAttribute(Qt.WA_Hover)    # repaint on hover enter/leave
 
     def paintEvent(self, _):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
-        border = max(2.0, 3.0 * self.scale)
-        r = QRectF(self.rect()).adjusted(border / 2, border / 2, -border / 2, -border / 2)
-        radius = 0.3 * r.height()
-
-        c = self.color
+        s = self.scale
+        ring = max(2.0, 3.0 * s)  # room for the focus ring
+        r = QRectF(self.rect()).adjusted(ring + 1, ring + 1, -ring - 1, -ring - 1)
+        radius = 0.32 * r.height()
+        fill, ink = self.STYLE[self.role]
+        icon = self.icon
+        if self.armed:
+            fill, ink, icon = FIREFLY, FIREFLY_TEXT, "power"
         if not self.isEnabled():
-            p.setOpacity(0.45)
-        if self.isDown():
-            c = c.darker(110)
-        elif self.underMouse() and self.isEnabled():
-            c = c.lighter(107)
-        fill = QLinearGradient(r.topLeft(), r.bottomLeft())
-        fill.setColorAt(0.0, c.lighter(106))
-        fill.setColorAt(1.0, c.darker(104))
-        p.setBrush(fill)
-        p.setPen(QPen(WHITE, border))
+            p.setOpacity(0.35)
+
+        hover = self.underMouse() and self.isEnabled()
+        if fill is None:  # outline
+            p.setBrush(with_alpha(LILAC, 0.22 if self.isDown() else 0.12 if hover else 0.0))
+            p.setPen(QPen(LILAC, max(1.5, 2.2 * s)))
+        else:
+            c = fill.darker(112) if self.isDown() else fill.lighter(108) if hover else fill
+            grad = QLinearGradient(r.topLeft(), r.bottomLeft())
+            grad.setColorAt(0.0, c.lighter(107))
+            grad.setColorAt(1.0, c.darker(106))
+            p.setBrush(grad)
+            p.setPen(QPen(with_alpha(WHITE, 0.25), max(1.0, 1.2 * s)))
         p.drawRoundedRect(r, radius, radius)
 
-        p.setFont(app_font(0.38 * r.height()))
-        p.setPen(QColor(40, 90, 25, 90))  # soft shadow keeps white text readable on light green
-        p.drawText(r.translated(0, max(1.0, 1.5 * self.scale)), Qt.AlignCenter, self.text())
-        p.setPen(WHITE)
-        p.drawText(r, Qt.AlignCenter, self.text())
+        # icon + label, centered together
+        font = app_font(0.34 * r.height(), QFont.ExtraBold)
+        tw = QFontMetricsF(font).horizontalAdvance(self.text())
+        isz = 0.36 * r.height()
+        gap = (0.42 if self.armed else 0.22) * r.height()  # armed: room for the countdown ring
+        x = r.center().x() - (isz + gap + tw) / 2
+        ir = QRectF(x, r.center().y() - isz / 2, isz, isz)
+        draw_icon(p, icon, ir, ink, max(1.5, 0.09 * isz))
+        if self.armed:  # countdown ring around the icon
+            p.setPen(QPen(ink, max(1.5, 0.08 * isz), Qt.SolidLine, Qt.RoundCap))
+            p.setBrush(Qt.NoBrush)
+            p.drawArc(ir.adjusted(-0.3 * isz, -0.3 * isz, 0.3 * isz, 0.3 * isz), 90 * 16,
+                      round(-360 * 16 * self.progress))
+        p.setFont(font)
+        p.setPen(ink)
+        p.drawText(QRectF(x + isz + gap, r.top(), tw + 4, r.height()), Qt.AlignVCenter | Qt.AlignLeft, self.text())
+
+        if self.hasFocus():
+            p.setOpacity(1.0)
+            p.setBrush(Qt.NoBrush)
+            p.setPen(QPen(with_alpha(LILAC, 0.9), max(1.5, 2.0 * s)))
+            p.drawRoundedRect(r.adjusted(-ring, -ring, ring, ring), radius + ring, radius + ring)
 
 
 class MainWindow(QWidget):
@@ -161,25 +284,30 @@ class MainWindow(QWidget):
         self.setMinimumSize(720, 480)
         self.pipeline, self.live = pipeline, live
         self.frame, self.seq, self.status, self.arm, self.state = None, 0, None, None, "idle"
+        self.alive = {}
         self.aspect = PREVIEW_ASPECT
         self.bg = None
-        self.cam_rect = QRectF()
+        self.cam_rect = QRectF()   # the camera image
+        self.bar_rect = QRectF()   # the status bar under it (one card with the image)
         self.s = 1.0
 
-        self.start_btn = RoundedButton("Start", GRASS, self)
-        self.calib_btn = RoundedButton("Calibrate", LILAC_DARK, self)
-        self.stop_btn = RoundedButton("Stop", ROSE, self)
-        self.torque_btn = RoundedButton("Torque Off", BRICK, self)
-        self.buttons = (self.start_btn, self.calib_btn, self.stop_btn, self.torque_btn)
-        self.start_btn.clicked.connect(lambda: self.pipeline.start())
+        # one Start / Stop button: what it does (and looks like) follows the pipeline state
+        self.run_btn = ForestButton("Start", "play", "primary", self)
+        self.calib_btn = ForestButton("Calibrate", "target", "outline", self)
+        self.torque_btn = ForestButton("Torque Off", "power", "danger", self)
+        self.buttons = (self.run_btn, self.calib_btn, self.torque_btn)
+        self.run_btn.clicked.connect(self.run_clicked)
+        self.run_switched = 0.0  # when it last turned from Start to Stop or back
         self.calib_btn.clicked.connect(self.pipeline.calibrate)
-        self.stop_btn.clicked.connect(lambda: self.pipeline.stop())
         self.torque_btn.clicked.connect(self.torque_clicked)
         self.has_bus = has_bus
         self.torque_armed = QTimer(self)  # running = the first click happened, waiting for the second
         self.torque_armed.setSingleShot(True)
         self.torque_armed.timeout.connect(self.torque_disarm)
         self.update_buttons()
+        # the window starts with the focus (q / Esc work, no focus ring on a button until Tab)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.setFocus()
 
         self.timer = QTimer(self)
         self.timer.timeout.connect(self.poll_pipeline)
@@ -192,42 +320,69 @@ class MainWindow(QWidget):
         super().resizeEvent(e)
 
     def layout_widgets(self):
+        """Title in the top margin; below it the camera card (image + status bar) and the
+        button row, centered together in the space left."""
         w, h = self.width(), self.height()
-        top = min(0.1 * w, 0.14 * h)            # title + vines
-        side = 0.07 * w                          # vines hang in the side margins
-        bw = w - 2 * side
-        bh = min(bw / self.aspect, h - top - 0.24 * h)
-        bw = bh * self.aspect
-        self.cam_rect = QRectF((w - bw) / 2, top, bw, bh)
-        room = h - self.cam_rect.bottom()
-        self.s = s = min(w / 1400, h / 820, room / 170)
+        self.s = s = min(w / 1400, h / 820)
+        top = self.header_height()               # logo + title, vines
+        side = 0.08 * w                          # vines hang in the side margins
+        bar, gap, bh_btn, bottom = STATUS_H * s, STACK_GAP * s, BUTTON_SIZE[1] * s, BOTTOM_MARGIN * s
+        cw = w - 2 * side
+        ch = min(cw / self.aspect, h - top - bar - gap - bh_btn - bottom)
+        cw = ch * self.aspect
+        y = top + 0.3 * max(0.0, h - top - bottom - (ch + bar + gap + bh_btn))  # spare room: mostly below
+        self.cam_rect = QRectF((w - cw) / 2, y, cw, ch)
+        self.bar_rect = QRectF(self.cam_rect.left(), self.cam_rect.bottom(), cw, bar)
 
-        sw, sh, gap = BUTTON_SIZE[0] * s, BUTTON_SIZE[1] * s, BUTTON_GAP * s
+        sw, sh, bgap = BUTTON_SIZE[0] * s, bh_btn, BUTTON_GAP * s
         n = len(self.buttons)
-        x = w / 2 - (n * sw + (n - 1) * gap) / 2
-        y = self.cam_rect.bottom() + 0.62 * (room - sh)  # the status card goes above them
+        x = w / 2 - (n * sw + (n - 1) * bgap) / 2
+        y = self.bar_rect.bottom() + gap
         for b in self.buttons:
             b.setGeometry(QRectF(x, y, sw, sh).toRect())
             b.scale = s
-            x += sw + gap
+            x += sw + bgap
 
         self.bg = self.render_background()
         self.update()
 
+    def header_height(self):
+        """The top band for the logo and title (the camera card starts below it)."""
+        return min(0.115 * self.width(), 0.15 * self.height())
+
+    def card_rect(self):
+        return self.cam_rect.united(self.bar_rect)
+
     def update_buttons(self):
         st = self.state
-        self.start_btn.setEnabled(st == "idle")
+        b = self.run_btn
+        role = "primary" if st == "idle" else "neutral"
+        if role != b.role:
+            b.role, b.icon = role, "play" if role == "primary" else "stop"
+            self.run_switched = time.monotonic()
+        b.setText({"idle": "Start", "stopping": "Stopping…"}.get(st, "Stop"))
+        b.setEnabled(st != "stopping")
+        b.update()
         self.calib_btn.setEnabled(st in ("idle", "running"))
-        self.stop_btn.setEnabled(st in ("starting", "running"))
-        self.start_btn.setText("Starting…" if st == "starting" else "Start")
-        self.stop_btn.setText("Stopping…" if st == "stopping" else "Stop")
         self.torque_btn.setEnabled(self.has_bus and st in ("idle", "starting", "running"))
         if not self.torque_btn.isEnabled() and self.torque_armed.isActive():
             self.torque_disarm()
-        self.torque_btn.setText("Confirm?" if self.torque_armed.isActive() else "Torque Off")
+        self.torque_btn.armed = self.torque_armed.isActive()
+        self.torque_btn.setText("Confirm?" if self.torque_btn.armed else "Torque Off")
+
+    def run_clicked(self):
+        """Start when idle, Stop while starting / running. Clicks right after it switched are
+        ignored, so a double-click on Start doesn't land on the Stop it just became."""
+        if time.monotonic() - self.run_switched < RUN_SWITCH_GUARD_S:
+            return
+        if self.state == "idle":
+            self.pipeline.start()
+        elif self.state in ("starting", "running"):
+            self.pipeline.stop()
+        self.poll_pipeline()  # show the new state right away
 
     def torque_clicked(self):
-        """First click arms (warning in the status card), a second within TORQUE_CONFIRM_MS drops the arm."""
+        """First click arms (warning in the status bar), a second within TORQUE_CONFIRM_MS drops the arm."""
         if self.torque_armed.isActive():
             self.torque_armed.stop()
             self.pipeline.clear_notice(TORQUE_WARNING)
@@ -241,16 +396,16 @@ class MainWindow(QWidget):
     def torque_disarm(self):
         self.torque_armed.stop()
         self.pipeline.clear_notice(TORQUE_WARNING)
+        self.torque_btn.armed = False
         self.torque_btn.setText("Torque Off")
+        self.torque_btn.update()
 
-    def cam_radius(self):
-        return 0.035 * min(self.width(), self.height())
-
-    def border_width(self):
-        return max(3.0, 5.0 * self.s)
+    def card_radius(self):
+        return 0.03 * min(self.width(), self.height())
 
     def render_background(self):
-        """Everything that doesn't change per frame: gradient, title, vines, shadows."""
+        """Everything that doesn't change per frame: night sky, glow, the forest
+        (forest.py), fireflies, title, shadows."""
         w, h = self.width(), self.height()
         dpr = self.devicePixelRatioF()
         pm = QPixmap(round(w * dpr), round(h * dpr))
@@ -259,66 +414,71 @@ class MainWindow(QWidget):
         p.setRenderHint(QPainter.Antialiasing)
 
         grad = QLinearGradient(0, 0, 0, h)
-        grad.setColorAt(0.0, LILAC_TOP)
-        grad.setColorAt(0.5, LILAC_MID)
-        grad.setColorAt(1.0, LILAC_BOTTOM)
+        grad.setColorAt(0.0, NIGHT_TOP)
+        grad.setColorAt(0.55, NIGHT_MID)
+        grad.setColorAt(1.0, NIGHT_BOTTOM)
         p.fillRect(QRectF(0, 0, w, h), grad)
+        card = self.card_rect()
+        glow = QRadialGradient(card.center(), 0.75 * max(card.width(), card.height()))
+        glow.setColorAt(0.0, GLOW)
+        glow.setColorAt(1.0, with_alpha(GLOW, 0.0))
+        p.fillRect(QRectF(0, 0, w, h), glow)
 
-        soft_shadow(p, self.cam_rect, self.cam_radius(), 18 * self.s, alpha=0.35, dy=8 * self.s)
-        for b in self.buttons:
-            r = QRectF(b.geometry())
-            soft_shadow(p, r, 0.3 * r.height(), 10 * self.s, alpha=0.22, dy=5 * self.s)
-
-        # title: the logo, then the name, centered together in the top margin
-        m = self.cam_rect.top()
-        font = app_font(max(14.0, min(0.45 * m, 0.055 * h)))
+        # title geometry first: the scenery keeps clear of it, the card and the buttons
+        m = self.header_height()
+        font = brand_font(max(16.0, min(0.5 * m, 0.068 * h)))
         px = font.pixelSize()
         text_w = QFontMetricsF(font).horizontalAdvance(APP_NAME)
         logo = self.logo
-        side = min(1.7 * px, 0.85 * m) if logo is not None else 0.0
+        side = min(1.75 * px, 0.92 * m) if logo is not None else 0.0
         gap = 0.35 * px if logo is not None else 0.0
         x0 = (w - (side + gap + text_w)) / 2
+        title_area = QRectF(x0 - px, 0, side + gap + text_w + 2 * px, m)
+        row = QRectF(self.buttons[0].geometry()).united(QRectF(self.buttons[-1].geometry()))
+        clear = [title_area, card, row]
+
+        forest.draw_back(p, w, h, clear)
+        forest.draw_fireflies(p, w, h, clear, random.Random(3))
+        soft_shadow(p, card, self.card_radius(), 22 * self.s, alpha=0.55, dy=10 * self.s)
+        for b in self.buttons:
+            r = QRectF(b.geometry())
+            soft_shadow(p, r.adjusted(4, 4, -4, -4), 0.3 * r.height(), 10 * self.s, alpha=0.4, dy=5 * self.s)
+        forest.draw_front(p, w, h, clear)
+
+        # title: the logo, then the name, centered together in the top margin
         if logo is not None:
             lr = QRectF(x0, (m - side) / 2, side, side)
             p.drawImage(lr, logo.scaled(round(side * dpr), round(side * dpr), Qt.KeepAspectRatio,
                                         Qt.SmoothTransformation))
         title = QRectF(x0 + side + gap, 0, text_w + 2, m)
         p.setFont(font)
-        p.setPen(QColor(SHADOW.red(), SHADOW.green(), SHADOW.blue(), 80))
+        p.setPen(with_alpha(LILAC, 0.35))  # soft lilac halo
         p.drawText(title.translated(0, max(1.0, 2 * self.s)), Qt.AlignVCenter | Qt.AlignLeft, APP_NAME)
-        p.setPen(WHITE)
+        p.setPen(TEXT)
         p.drawText(title, Qt.AlignVCenter | Qt.AlignLeft, APP_NAME)
-
-        if not self.live:  # under the buttons
-            below = QRectF(0, self.start_btn.geometry().bottom(), w, h - self.start_btn.geometry().bottom())
-            p.setFont(app_font(max(10.0, 15 * self.s)))
-            p.setPen(SHADOW)
-            p.drawText(below, Qt.AlignCenter, "dry run: the arm doesn't move")
-
-        draw_corner_vines(p, w, h, random.Random(7))
-        p.translate(w, 0)
-        p.scale(-1, 1)  # right corner: mirror image, different leaf jitter
-        draw_corner_vines(p, w, h, random.Random(11))
         p.end()
         return pm
 
-    # ---- camera -------------------------------------------------------------
+    # ---- camera + status ----------------------------------------------------
 
     def poll_pipeline(self):
         f, seq, status, arm, state = self.pipeline.latest()
+        alive = self.pipeline.alive()
         if state != self.state:
             self.state = state
             self.update_buttons()
-        if (seq == self.seq and status == self.status and arm == self.arm
+        if self.torque_btn.armed:  # countdown ring
+            self.torque_btn.progress = self.torque_armed.remainingTime() / TORQUE_CONFIRM_MS
+            self.torque_btn.update()
+        if (seq == self.seq and status == self.status and arm == self.arm and alive == self.alive
                 and (f is None) == (self.frame is None)):
             return
-        self.frame, self.seq, self.status, self.arm = f, seq, status, arm
+        self.frame, self.seq, self.status, self.arm, self.alive = f, seq, status, arm, alive
         if f is not None and abs(f.shape[1] / f.shape[0] - self.aspect) > 0.01:
-            self.aspect = f.shape[1] / f.shape[0]  # the box follows the preview's shape
+            self.aspect = f.shape[1] / f.shape[0]  # the card follows the preview's shape
             self.layout_widgets()
-        pad = self.border_width()  # the box and the status card under it
-        top = self.start_btn.geometry().top()
-        self.update(self.cam_rect.adjusted(-pad, -pad, pad, top - self.cam_rect.bottom()).toAlignedRect())
+        pad = 4 * max(1.0, self.s)
+        self.update(self.card_rect().adjusted(-pad, -pad, pad, pad).toAlignedRect())
 
     def paintEvent(self, _):
         p = QPainter(self)
@@ -326,77 +486,141 @@ class MainWindow(QWidget):
         if self.bg is not None:
             p.drawPixmap(0, 0, self.bg)
 
-        box = self.cam_rect
-        radius = self.cam_radius()
-        clip = QPainterPath()
-        clip.addRoundedRect(box, radius, radius)
+        card, box, radius = self.card_rect(), self.cam_rect, self.card_radius()
+        outline = QPainterPath()
+        outline.addRoundedRect(card, radius, radius)
+        p.fillPath(outline, CARD)
 
+        p.save()
+        p.setClipPath(outline)
+        p.setClipRect(box, Qt.IntersectClip)  # the image: the card's top, square bottom corners
         if self.frame is not None:
             f = self.frame
             img = QImage(f.data, f.shape[1], f.shape[0], f.strides[0], QImage.Format_BGR888)
             # cover-fit (the box has the frame's aspect, so at most a pixel is cropped)
             k = max(box.width() / img.width(), box.height() / img.height())
             sw, sh = box.width() / k, box.height() / k
-            src = QRectF((img.width() - sw) / 2, (img.height() - sh) / 2, sw, sh)
-            p.save()
-            p.setClipPath(clip)
-            p.drawImage(box, img, src)
-            p.restore()
+            p.drawImage(box, img, QRectF((img.width() - sw) / 2, (img.height() - sh) / 2, sw, sh))
         else:
-            p.fillPath(clip, QColor(255, 255, 255, 45))
-            msg = {"idle": "Press Start", "stopping": "Stopping…"}.get(self.state, "")
-            p.setFont(app_font(0.032 * min(self.width(), self.height())))
-            p.setPen(WHITE)
-            p.drawText(box, Qt.AlignCenter, msg)
+            self.paint_empty(p, box)
+        p.restore()
 
-        if self.status is not None and (self.status[0] or self.status[1]):
-            self.paint_status(p, *self.status)
-        if self.arm is not None:
-            self.paint_arm(p, *self.arm)
-
+        self.paint_bar(p)
+        p.setPen(QPen(with_alpha(CARD_EDGE, 0.35), max(1.0, 1.2 * self.s)))
+        p.drawLine(QPointF(box.left(), box.bottom()), QPointF(box.right(), box.bottom()))
         p.setBrush(Qt.NoBrush)
-        p.setPen(QPen(WHITE, self.border_width()))
-        p.drawRoundedRect(box, radius, radius)
+        p.setPen(QPen(CARD_EDGE, max(1.5, 2.2 * self.s)))
+        p.drawPath(outline)
 
-    def paint_status(self, p, text, detail, kind):
-        """Rounded card between the camera box and the buttons: a main line, plus smaller detail lines."""
-        s, box = self.s, self.cam_rect
-        pad_x, pad_y, gap = 22 * s, 12 * s, 4 * s
-        max_w = box.width() - 2 * (24 * s + pad_x)
-        flags = Qt.AlignCenter | Qt.TextWordWrap
-        lines = [(app_font(max(12.0, 19 * s)), text, WHITE)]
-        if detail:
-            lines.append((app_font(max(10.0, 14 * s)), detail, QColor(255, 255, 255, 210)))
-        rects = [QFontMetricsF(f).boundingRect(QRectF(0, 0, max_w, 1e4), flags, t) for f, t, _ in lines]
-
-        w = max(r.width() for r in rects) + 2 * pad_x
-        h = sum(r.height() for r in rects) + gap * (len(rects) - 1) + 2 * pad_y
-        card = QRectF(box.center().x() - w / 2, box.bottom() + 22 * s, w, h)
-        p.setBrush(STATUS_BG[kind])
-        p.setPen(QPen(QColor(255, 255, 255, 200), max(1.5, 2 * s)))
-        p.drawRoundedRect(card, min(h / 2, 16 * s), min(h / 2, 16 * s))
-
-        y = card.top() + pad_y
-        for (font, t, color), r in zip(lines, rects):
-            p.setFont(font)
-            p.setPen(color)
-            p.drawText(QRectF(card.left() + pad_x, y, w - 2 * pad_x, r.height()), flags, t)
-            y += r.height() + gap
-
-    def paint_arm(self, p, text, alarm):
-        """The arm driver's state (/hw/status), a pill along the top of the camera box."""
-        s, box = self.s, self.cam_rect
-        font = app_font(max(10.0, 14 * s))
-        fm = QFontMetricsF(font)
-        w = min(fm.horizontalAdvance(text) + 32 * s, box.width() - 40 * s)
-        h = fm.height() + 14 * s
-        pill = QRectF(box.center().x() - w / 2, box.top() + 16 * s, w, h)
-        p.setBrush(ALARM_BG if alarm else QColor(58, 28, 104, 150))
-        p.setPen(QPen(QColor(255, 255, 255, 200), max(1.5, 2 * s)))
-        p.drawRoundedRect(pill, h / 2, h / 2)
+    def paint_empty(self, p, box):
+        """No preview yet: the logo, faint, and what to do."""
+        glow = QRadialGradient(box.center(), 0.6 * box.height())
+        glow.setColorAt(0.0, with_alpha(LILAC, 0.10))
+        glow.setColorAt(1.0, with_alpha(LILAC, 0.0))
+        p.fillRect(box, glow)
+        side = 0.42 * box.height()
+        msg = {"idle": "Press Start", "stopping": "Stopping…"}.get(self.state, "Getting ready…")
+        font = app_font(max(12.0, 22 * self.s), QFont.Bold)
+        th = QFontMetricsF(font).height()
+        y = box.center().y() - (side + 0.4 * th + th) / 2
+        if self.logo is not None:
+            p.setOpacity(0.28)
+            p.drawImage(QRectF(box.center().x() - side / 2, y, side, side), self.logo)
+            p.setOpacity(1.0)
         p.setFont(font)
-        p.setPen(WHITE)
-        p.drawText(pill, Qt.AlignCenter, fm.elidedText(text, Qt.ElideRight, w - 24 * s))
+        p.setPen(MUTED)
+        p.drawText(QRectF(box.left(), y + side + 0.4 * th, box.width(), th), Qt.AlignCenter, msg)
+
+    def chip(self, p, x_right, cy, text, fill, ink, font, edge=None):
+        """Pill ending at x_right, centered on cy; returns its left edge."""
+        fm = QFontMetricsF(font)
+        s = self.s
+        w, h = fm.horizontalAdvance(text) + 22 * s, fm.height() + 8 * s
+        r = QRectF(x_right - w, cy - h / 2, w, h)
+        p.setBrush(fill)
+        p.setPen(QPen(edge, max(1.0, 1.2 * s)) if edge is not None else Qt.NoPen)
+        p.drawRoundedRect(r, h / 2, h / 2)
+        p.setFont(font)
+        p.setPen(ink)
+        p.drawText(r, Qt.AlignCenter, text)
+        return r.left()
+
+    def paint_bar(self, p):
+        """Status bar: [dot  status  · detail]   [arm chip] [IK · Arm · Hand dots] [LIVE]."""
+        s, bar = self.s, self.bar_rect
+        cy = bar.center().y()
+        pad = 18 * s
+        text, detail, kind = self.status if self.status else ("", "", "info")
+        if not (text or detail):
+            text, detail, kind = KIND_LABEL.get(self.state, ""), "", "hold" if self.state == "running" else "info"
+            if self.state == "idle":
+                kind = "hold"
+        color = KIND_COLOR.get(kind, LILAC)
+        if kind in ("error", "lost"):  # tint the whole bar
+            p.save()
+            outline = QPainterPath()
+            outline.addRoundedRect(self.card_rect(), self.card_radius(), self.card_radius())
+            p.setClipPath(outline)
+            p.fillRect(bar, with_alpha(color, 0.16))
+            p.restore()
+
+        # right side, laid out right to left
+        small = app_font(max(9.0, 12.5 * s), QFont.ExtraBold)
+        x = bar.right() - pad
+        x = self.chip(p, x, cy, "LIVE" if self.live else "DRY RUN", EMBER if self.live else FIREFLY,
+                      WHITE if self.live else FIREFLY_TEXT, small) - 16 * s
+        dot_font = app_font(max(9.0, 12.5 * s), QFont.DemiBold)
+        fm = QFontMetricsF(dot_font)
+        for name, label in (("hand", "Hand"), ("arm", "Arm"), ("ik", "IK")):
+            up = self.alive.get(name, False)
+            tw = fm.horizontalAdvance(label)
+            p.setFont(dot_font)
+            p.setPen(TEXT if up else MUTED)
+            p.drawText(QRectF(x - tw, bar.top(), tw + 2, bar.height()), Qt.AlignVCenter | Qt.AlignLeft, label)
+            x -= tw + 6 * s
+            p.setPen(Qt.NoPen)
+            p.setBrush(GRASS if up else with_alpha(MUTED, 0.45))
+            p.drawEllipse(QPointF(x - 4 * s, cy), 4 * s, 4 * s)
+            x -= 8 * s + 12 * s
+        if self.arm is not None:
+            arm_text, alarm = self.arm
+            arm_font = app_font(max(9.0, 13 * s), QFont.Bold, digits=True)
+            room = max(0.0, x - bar.left() - 0.45 * bar.width())
+            arm_text = QFontMetricsF(arm_font).elidedText(arm_text, Qt.ElideRight, room)
+            if arm_text:
+                x = self.chip(p, x, cy, arm_text, EMBER if alarm else with_alpha(LILAC, 0.14),
+                              WHITE if alarm else TEXT, arm_font,
+                              edge=None if alarm else with_alpha(LILAC, 0.35)) - 14 * s
+
+        # left side: state dot, status, detail on the same line (detail lines joined)
+        lx = bar.left() + pad
+        r = 6 * s
+        if kind in ("track", "lost", "error"):  # a soft halo around the dot
+            halo = QRadialGradient(QPointF(lx + r, cy), 3 * r)
+            halo.setColorAt(0.0, with_alpha(color, 0.55))
+            halo.setColorAt(1.0, with_alpha(color, 0.0))
+            p.setPen(Qt.NoPen)
+            p.setBrush(halo)
+            p.drawEllipse(QPointF(lx + r, cy), 3 * r, 3 * r)
+        p.setPen(Qt.NoPen)
+        p.setBrush(color)
+        p.drawEllipse(QPointF(lx + r, cy), r, r)
+        lx += 2 * r + 12 * s
+        room = x - lx - 8 * s
+        main_font = app_font(max(11.0, 17 * s), QFont.ExtraBold)
+        fm = QFontMetricsF(main_font)
+        main = fm.elidedText(text, Qt.ElideRight, room)
+        p.setFont(main_font)
+        p.setPen(TEXT)
+        p.drawText(QRectF(lx, bar.top(), room, bar.height()), Qt.AlignVCenter | Qt.AlignLeft, main)
+        lx += fm.horizontalAdvance(main) + 14 * s
+        detail = "   ·   ".join(ln for ln in detail.split("\n") if ln.strip())
+        if detail and x - lx > 40 * s:
+            dfont = app_font(max(10.0, 14 * s), QFont.DemiBold, digits=True)
+            p.setFont(dfont)
+            p.setPen(MUTED)
+            p.drawText(QRectF(lx, bar.top(), x - lx - 8 * s, bar.height()), Qt.AlignVCenter | Qt.AlignLeft,
+                       QFontMetricsF(dfont).elidedText(detail, Qt.ElideRight, x - lx - 8 * s))
 
     def keyPressEvent(self, e):
         if e.key() in (Qt.Key_Q, Qt.Key_Escape):
@@ -410,139 +634,6 @@ class MainWindow(QWidget):
         super().closeEvent(e)
 
 
-# ---- vines ----------------------------------------------------------------
-
-def leaf_path(length, width):
-    """Almond leaf with its base at the origin, pointing down local +y."""
-    path = QPainterPath(QPointF(0, 0))
-    path.cubicTo(width, 0.15 * length, 0.75 * width, 0.7 * length, 0, length)
-    path.cubicTo(-0.75 * width, 0.7 * length, -width, 0.15 * length, 0, 0)
-    return path
-
-
-def draw_leaf(p, at, stem_deg, splay_deg, length, color):
-    """Leaf on a short stalk at `at`, splayed `splay_deg` off the stem direction."""
-    width = 0.42 * length
-    stalk = 0.12 * length
-    p.save()
-    p.translate(at)
-    p.rotate(stem_deg - 90 + splay_deg)  # local +y now points along the leaf
-    p.setPen(QPen(STEM, max(1.0, 0.07 * width), Qt.SolidLine, Qt.RoundCap))
-    p.drawLine(QPointF(0, 0), QPointF(0, stalk))
-    p.translate(0, stalk)
-
-    fill = QLinearGradient(-width, 0, width, 0)
-    fill.setColorAt(0.0, color.lighter(118))
-    fill.setColorAt(1.0, color.darker(106))
-    edge = QColor(STEM)
-    edge.setAlpha(120)
-    p.setBrush(fill)
-    p.setPen(QPen(edge, 1.0))
-    p.drawPath(leaf_path(length, width))
-
-    vein = QColor(STEM)
-    vein.setAlpha(150)
-    p.setPen(QPen(vein, max(1.0, 0.06 * width), Qt.SolidLine, Qt.RoundCap))
-    p.drawLine(QPointF(0, 0.08 * length), QPointF(0, 0.8 * length))
-    p.restore()
-
-
-def draw_stem(p, pts, w0, w1):
-    """Polyline that tapers from width w0 to w1."""
-    n = len(pts) - 1
-    for i in range(n):
-        p.setPen(QPen(STEM, w0 + (w1 - w0) * i / n, Qt.SolidLine, Qt.RoundCap))
-        p.drawLine(pts[i], pts[i + 1])
-
-
-def draw_tendril(p, at, size, turn):
-    """Small curl starting at `at`; turn = +1 / -1 picks the spin direction."""
-    a0 = math.pi if turn > 0 else 0.0
-    center = QPointF(at.x() - size * math.cos(a0), at.y() - size * math.sin(a0))
-    path = QPainterPath(at)
-    for i in range(1, 30):
-        t = i / 29
-        a = a0 + turn * 2.6 * math.pi * t
-        r = size * (1 - 0.8 * t)
-        path.lineTo(center.x() + r * math.cos(a), center.y() + r * math.sin(a))
-    p.setBrush(Qt.NoBrush)
-    p.setPen(QPen(STEM, max(1.0, 0.12 * size), Qt.SolidLine, Qt.RoundCap))
-    p.drawPath(path)
-
-
-def stem_angle(pts, i):
-    a, b = pts[max(0, i - 1)], pts[min(len(pts) - 1, i + 1)]
-    return math.degrees(math.atan2(b.y() - a.y(), b.x() - a.x()))
-
-
-def leaf_color(rng):
-    r = rng.random()
-    return GRASS_DARK if r < 0.35 else GRASS.lighter(108) if r > 0.85 else GRASS
-
-
-def draw_corner_vines(p, w, h, rng):
-    """Vines for the top-left corner (the caller mirrors them for the right).
-
-    A vine drapes along the top edge and strands hang from it. Strands beside
-    the camera stay inside the side margin; the rest end above the camera.
-    """
-    u = 0.1 * w           # side/top margin
-    k = 0.1 * min(w, h)   # leaf size unit (<= u, so leaves fit in the margin)
-
-    # Swag: enters off the left edge, sags, and leaves off the top edge.
-    x0, x1 = -0.3 * u, 2.9 * u
-
-    def swag(t):
-        return QPointF(x0 + (x1 - x0) * t, 0.05 * u - 0.15 * u * t + 0.36 * u * math.sin(math.pi * t))
-
-    swag_pts = [swag(i / 59) for i in range(60)]
-
-    # (x, length, sway, phase): the first hangs beside the camera, the rest above it.
-    strand_specs = [(0.38 * u, 0.45 * h, 0.06 * u, 0.0),
-                    (0.80 * u, 0.36 * u, 0.04 * u, 1.3),
-                    (1.45 * u, 0.36 * u, 0.05 * u, 2.1),
-                    (2.15 * u, 0.24 * u, 0.04 * u, 0.7)]
-    strands = []
-    for x, length, sway, phase in strand_specs:
-        top = swag((x - x0) / (x1 - x0))
-        n = max(8, int(length / (0.04 * k)))
-        strands.append([QPointF(top.x() + sway * math.sin(phase + 5.0 * t) * t, top.y() + length * t)
-                         for t in (i / (n - 1) for i in range(n))])
-
-    draw_stem(p, swag_pts, 0.075 * k, 0.03 * k)
-    for pts in strands:
-        draw_stem(p, pts, 0.05 * k, 0.022 * k)
-    draw_tendril(p, strands[0][len(strands[0]) * 2 // 5], 0.11 * k, 1)
-    draw_tendril(p, swag_pts[38], 0.09 * k, -1)
-    draw_tendril(p, strands[2][len(strands[2]) // 2], 0.08 * k, -1)
-
-    # Leaves along the swag: alternate hanging below and perking up above.
-    side = 1
-    t = 0.02
-    while t < 0.97:
-        i = int(t * 59)
-        splay = rng.uniform(50, 75) if side > 0 else -rng.uniform(30, 50)
-        size = 0.30 * k * rng.uniform(0.85, 1.1) * (1.0 if side > 0 else 0.8)
-        draw_leaf(p, swag_pts[i], stem_angle(swag_pts, i), splay, size, leaf_color(rng))
-        side = -side
-        t += 0.045 * rng.uniform(0.85, 1.15)
-
-    # Leaves along each strand: alternate sides, plus one at the tip.
-    for pts in strands:
-        length = pts[-1].y() - pts[0].y()
-        side = 1 if rng.random() < 0.5 else -1
-        d = 0.18 * k
-        while d < length - 0.12 * k:
-            i = int(d / length * (len(pts) - 1))
-            splay = side * rng.uniform(35, 60)
-            draw_leaf(p, pts[i], stem_angle(pts, i), splay, 0.28 * k * rng.uniform(0.85, 1.15),
-                      leaf_color(rng))
-            side = -side
-            d += 0.27 * k * rng.uniform(0.85, 1.15)
-        draw_leaf(p, pts[-1], stem_angle(pts, len(pts) - 1), rng.uniform(-10, 10), 0.24 * k,
-                  leaf_color(rng))
-
-
 def main():
     argv = sys.argv[1:]
     extra = argv[argv.index("--") + 1:] if "--" in argv else []  # for hand_target_node.py
@@ -553,7 +644,13 @@ def main():
     ap.add_argument("--no-bus", action="store_true", help="dry run without the arm attached (implies --dry-run)")
     ap.add_argument("--cams", nargs=2, default=None, metavar=("LEFT", "RIGHT"),
                     help="camera indices (default 1 0; stereo_cam.py --list)")
+    ap.add_argument("--contrast", action="store_true", help="print the palette's text contrast ratios and exit")
     args = ap.parse_args(argv)
+    if args.contrast:
+        for name, fg, bg in CONTRAST_PAIRS:
+            r = contrast(fg, bg)
+            print(f"{name:<15} {fg.name()} on {bg.name()}  {r:4.1f}:1  {'ok' if r >= 4.5 else 'LOW'}")
+        return
     live = not (args.dry_run or args.no_bus)
     hand = list(HAND_ARGS)
     if args.cams:
@@ -564,11 +661,7 @@ def main():
     app.setApplicationName(APP_NAME)
     if os.path.exists(LOGO_PATH):
         app.setWindowIcon(QIcon(LOGO_PATH))  # the Dock icon on macOS
-    fid = QFontDatabase.addApplicationFont(FONT_PATH)
-    if fid >= 0:
-        app_font.family = QFontDatabase.applicationFontFamilies(fid)[0]
-    else:
-        print(f"warning: couldn't load {FONT_PATH}; using the system font", file=sys.stderr)
+    load_fonts()
     app.setFont(app_font(14))
 
     pipeline = Pipeline(hand + extra, arm)

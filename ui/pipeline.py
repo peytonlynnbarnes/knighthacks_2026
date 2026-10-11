@@ -57,6 +57,7 @@ class Pipeline:
         self.procs = {}           # name -> Popen
         self.tails = {}           # name -> last output lines
         self.conn = None          # the hand node's socket
+        self.streaming = False    # its first frame came: it reads 'q' (before, it's loading)
         self.gen = 0              # start() count: threads of an old run stop touching state
         self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -73,12 +74,18 @@ class Pipeline:
                 self.status = None
             return self.frame, self.seq, self.status, self.arm, self.state
 
+    def alive(self):
+        """{name: still running} for the started processes (empty when stopped)."""
+        with self.lock:
+            procs = dict(self.procs)
+        return {name: p.poll() is None for name, p in procs.items()}
+
     def start(self, calibrate=False):
         with self.lock:
             if self.state != "idle":
                 return
             self.state, self.gen = "starting", self.gen + 1
-            self.frame, self.arm = None, None
+            self.frame, self.arm, self.streaming = None, None, False
         err = self._preflight()
         if err:
             self._set_state("idle")
@@ -234,6 +241,7 @@ class Pipeline:
                         if "loading" in meta:
                             self.status = (meta["loading"], "", "info")
                         continue
+                    self.streaming = True
                     if self.state == "starting":  # first frame: WiLoR, cameras, ROS all up
                         self.state = "running"
                     self.frame = np.frombuffer(img, np.uint8).reshape(meta["h"], meta["w"], 3)
@@ -248,13 +256,13 @@ class Pipeline:
 
     def _stop_all(self, release=False):
         print(f"[ui] stopping the pipeline{', torque OFF' if release else ''}", flush=True)
-        # the hand node finishes its pair and closes cameras / ROS on 'q' (Ctrl-C while it's
-        # still loading, before it reads the socket); Ctrl-C: feetech_mirror holds the arm's pose,
-        # SIGUSR1: it turns torque off instead
+        # the hand node finishes its pair and closes cameras / ROS on 'q' (Ctrl-C until its
+        # first frame: while loading it doesn't read the socket); Ctrl-C: feetech_mirror holds
+        # the arm's pose, SIGUSR1: it turns torque off instead
         with self.lock:
-            connected = self.conn is not None
+            streaming = self.streaming
         self._send(b"q")
-        for name in ("arm", "ik") if connected else ("hand", "arm", "ik"):
+        for name in ("arm", "ik") if streaming else ("hand", "arm", "ik"):
             self._signal(name, signal.SIGUSR1 if release and name == "arm" else signal.SIGINT)
         for name in ("hand", "arm", "ik"):
             p = self.procs.get(name)
