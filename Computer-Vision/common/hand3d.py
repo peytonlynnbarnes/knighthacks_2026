@@ -198,6 +198,20 @@ def palm_fit(X, template):
     return o, R, rms
 
 
+def twist_about(R, axis):
+    """Twist angle (rad) of rotation R about a unit axis, in R's frame (swing-twist split)."""
+    v = matrix_to_rotvec(R)
+    th = float(np.linalg.norm(v))
+    if th < 1e-12:
+        return 0.0
+    return 2.0 * math.atan2(math.sin(th / 2) * float(v @ np.asarray(axis, float)) / th, math.cos(th / 2))
+
+
+def twist_x(R):
+    """Twist angle (rad) of rotation R about its body x axis (swing-twist split)."""
+    return twist_about(R, (1.0, 0.0, 0.0))
+
+
 def rotation_angle(R):
     """Angle (rad) of a rotation matrix."""
     return math.acos(max(-1.0, min(1.0, (np.trace(R) - 1) / 2)))

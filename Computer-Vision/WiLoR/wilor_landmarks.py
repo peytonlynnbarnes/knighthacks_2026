@@ -23,6 +23,16 @@ Per call, for each view:
   3. Both views in one forward pass (fp16 on the GPU: Apple MPS, or CUDA). Keypoints come back in
      crop units (-0.5..0.5 around the center) and map back exactly.
 
+Two hands (hands=2, ../TWO_HAND_PLAN.md): tracks per (side, view). Existing tracks
+re-match by box overlap (highest first, so two hands never share a detection) and keep
+their side; new ones take the detector's class (conf >= conf_start); one new hand
+labelled differently in the two views is one hand (the more confident label wins).
+__call__ still returns the main hand (`hand`: right unless "left"); the other hand is
+self.other = (px0, px1) or (None, None), updated every `other_every` calls
+(self.other_fresh says whether it ran this call: not run != lost). Default every call:
+on MPS, alternating batch sizes (2 / 4) costs ~15-25 ms per switch, so every 2nd call
+gave 8.4 pairs/s vs 8.0 (M5 Pro, 1280x720); steady batches: 2 = 75, 3 = 94, 4 = 121 ms.
+
 Extras for later phases (MANO rotation, single-view 3D): self.last[view] =
 {"box", "is_right", "conf", "global_orient" (3x3, in the crop's camera, mirrored
 for left hands), "kp3d" (21x3 m, same frame), "cam_t"} or None.
@@ -124,7 +134,8 @@ class StereoLandmarks:
     """WiLoR on both views, one hand. hand: 'any', 'right' or 'left' (the user's hand)."""
 
     def __init__(self, yolo_every=4, conf=0.3, conf_start=0.5, rescale=2.0, hand="any", yolo_size=320,
-                 device=None, fp32=False, warmup_size=(640, 480), max_size_jump=1.55, max_shift=0.6):
+                 device=None, fp32=False, warmup_size=(640, 480), max_size_jump=1.55, max_shift=0.6,
+                 hands=1, other_every=1):
         import torch
         self.torch = torch
         self.model, self.detector, self.dev, self.dtype = load_models(device, fp32)
@@ -144,6 +155,15 @@ class StereoLandmarks:
         self.good = [None, None]       # per view: last accepted keypoint box
         self.redetect = [False, False]  # run YOLO on this view next call
         self.rejected = [0, 0]          # dropped frames per view (diagnostics)
+        # two hands: per side, per view (same meaning as track / good / redetect above)
+        self.hands, self.other_every = hands, max(1, int(other_every))
+        self.main = "left" if hand == "left" else "right"
+        self.other_side = "left" if self.main == "right" else "right"
+        self.tr2 = {s: [None, None] for s in ("right", "left")}
+        self.good2 = {s: [None, None] for s in ("right", "left")}
+        self.redetect2 = {s: [False, False] for s in ("right", "left")}
+        self.last2 = {s: [None, None] for s in ("right", "left")}
+        self.other, self.other_fresh = (None, None), False
         if warmup_size:
             self.warmup(warmup_size)
 
@@ -158,14 +178,16 @@ class StereoLandmarks:
         for k in (1, 2):  # YOLO on one or both views
             self.detector([blank] * k, verbose=False, conf=self.conf, imgsz=self.yolo_size, device=self.dev)
         with torch.inference_mode():
-            for k in (1, 2):  # WiLoR on the hand in one or both views
+            for k in range(1, 2 * self.hands + 1):  # WiLoR on 1..2 hands x 1..2 views
                 x = torch.zeros((k, 3, CROP, CROP), device=self.dev, dtype=self.dtype)
                 self.model({"img": x})["pred_keypoints_2d"].float().cpu()
         print(f"WiLoR warm-up {time.perf_counter() - t0:.1f} s", flush=True)
 
     # -- detection ---------------------------------------------------------
-    def _detect(self, frames):
-        """Per frame: list of (box, is_right, conf), YOLO in one batch."""
+    def _detect(self, frames, hand=None):
+        """Per frame: list of (box, is_right, conf), YOLO in one batch. hand: filter
+        ("any" / "right" / "left"), default self.hand."""
+        hand = self.hand if hand is None else hand
         # device explicitly: ultralytics picks CUDA or the CPU by itself, never MPS
         res = self.detector(list(frames), verbose=False, conf=self.conf, imgsz=self.yolo_size, device=self.dev)
         out = []
@@ -175,8 +197,8 @@ class StereoLandmarks:
             cls = b.cls.cpu().numpy().astype(int)
             cf = b.conf.cpu().numpy().astype(float)
             dets = [(tuple(xyxy[i]), bool(cls[i] == 1), float(cf[i])) for i in range(len(cf))]
-            if self.hand != "any":
-                dets = [d for d in dets if d[1] == (self.hand == "right")]
+            if hand != "any":
+                dets = [d for d in dets if d[1] == (hand == "right")]
             out.append(dets)
         return out
 
@@ -203,6 +225,8 @@ class StereoLandmarks:
 
     # -- main --------------------------------------------------------------
     def __call__(self, f0, f1, t=None):
+        if self.hands == 2:
+            return self._call2((f0, f1))
         frames = (f0, f1)
         self.n += 1
         need = [self.track[v] is None or self.n % self.yolo_every == 1 or self.redetect[v]
@@ -270,6 +294,121 @@ class StereoLandmarks:
             tr["box"] = box
         return px[0], px[1]
 
+    # -- two hands -----------------------------------------------------------
+    def _assign2(self, dets, v, fresh_sides):
+        """Detections of view v -> self.tr2[side][v]. Existing tracks first, by overlap
+        (highest IoU first, each detection used once); then new tracks by class."""
+        pairs = sorted(((_iou(d[0], self.tr2[s][v]["box"]), s, i) for s in ("right", "left")
+                        if self.tr2[s][v] is not None for i, d in enumerate(dets)), reverse=True)
+        used, matched = set(), set()
+        for iou, s, i in pairs:
+            if iou <= 0.1 or s in matched or i in used:
+                continue
+            tr = self.tr2[s][v]
+            tr["box"], tr["conf"] = dets[i][0], dets[i][2]  # keeps its side (class flips ~1 %)
+            used.add(i)
+            matched.add(s)
+        for s in ("right", "left"):
+            if s in matched:
+                continue
+            cands = [d for i, d in enumerate(dets) if i not in used and d[1] == (s == "right")
+                     and d[2] >= self.conf_start]
+            if not cands:
+                self.tr2[s][v] = None
+                continue
+            d = max(cands, key=lambda d: (d[0][2] - d[0][0]) * (d[0][3] - d[0][1]))
+            used.add(next(i for i, e in enumerate(dets) if e is d))
+            self.tr2[s][v] = {"box": d[0], "is_right": s == "right", "conf": d[2]}
+            fresh_sides[v].add(s)
+
+    def _agree2(self, fresh_sides):
+        """One new hand labelled right in one view and left in the other is one hand:
+        the more confident label wins (the other view's track moves over)."""
+        for a in (0, 1):
+            b = 1 - a
+            for s in ("right", "left"):
+                o = "left" if s == "right" else "right"
+                if (s in fresh_sides[a] and o in fresh_sides[b] and self.tr2[s][b] is None
+                        and self.tr2[o][a] is None):
+                    keep, move = (s, o) if self.tr2[s][a]["conf"] >= self.tr2[o][b]["conf"] else (o, s)
+                    src = b if keep == s else a
+                    tr = self.tr2[move][src]
+                    tr["is_right"] = keep == "right"
+                    self.tr2[keep][src], self.tr2[move][src] = tr, None
+                    return
+
+    def _call2(self, frames):
+        self.n += 1
+        sides = ("right", "left")
+        # YOLO on a view when its main-hand track is missing or suspect, or a tracked hand
+        # needs it; a missing other hand waits for the regular pass (else one hand in view
+        # would cost a YOLO pass on every call)
+        need = [self.tr2[self.main][v] is None or self.n % self.yolo_every == 1
+                or any(self.tr2[s][v] is not None and (self.redetect2[s][v]
+                       or not self._plausible(self.tr2[s][v], frames[v].shape)) for s in sides)
+                for v in (0, 1)]
+        for s in sides:
+            self.redetect2[s] = [False, False]
+        if any(need):
+            dets = self._detect([frames[v] for v in (0, 1) if need[v]], hand="any")
+            it = iter(dets)
+            fresh_sides = [set(), set()]
+            for v in (0, 1):
+                if need[v]:
+                    self._assign2(next(it), v, fresh_sides)
+            self._agree2(fresh_sides)
+        run_other = self.n % self.other_every == 0 or all(o is None for o in self.other)
+        jobs = [(s, v) for s in sides for v in (0, 1) if self.tr2[s][v] is not None
+                and (s == self.main or run_other)]
+        for s in sides:
+            for v in (0, 1):
+                if self.tr2[s][v] is None:
+                    self.good2[s][v] = None
+                if s == self.main or run_other:
+                    self.last2[s][v] = None
+        px = {s: [None, None] for s in sides}
+        if jobs:
+            crops, metas = [], []
+            for s, v in jobs:
+                cx, cy, size = square_box(*self.tr2[s][v]["box"], self.rescale)
+                flip = s == "left"
+                img = cv2.warpAffine(frames[v], crop_matrix(cx, cy, size, flip), (CROP, CROP),
+                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+                crops.append(img[:, :, ::-1])
+                metas.append((cx, cy, size, flip))
+            torch = self.torch
+            with torch.inference_mode():
+                x = torch.from_numpy(np.ascontiguousarray(np.stack(crops))).to(self.dev)
+                x = (x.permute(0, 3, 1, 2).to(self.dtype) - self.mean) / self.std
+                out = self.model({"img": x})
+                kp2 = out["pred_keypoints_2d"].float().cpu().numpy()
+                kp3 = out["pred_keypoints_3d"].float().cpu().numpy()
+                rot = out["pred_mano_params"]["global_orient"].float().cpu().numpy().reshape(len(jobs), 3, 3)
+                cam_t = out["pred_cam_t"].float().cpu().numpy()
+            for i, (s, v) in enumerate(jobs):
+                p = crop_to_frame(kp2[i], *metas[i])
+                tr = self.tr2[s][v]
+                if not np.all(np.isfinite(p)):
+                    self.tr2[s][v] = None
+                    continue
+                box = (p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max())
+                if not need[v] and self._sudden(self.good2[s][v], box):
+                    tr["box"] = self.good2[s][v]
+                    self.redetect2[s][v] = True
+                    self.rejected[v] += 1
+                    continue
+                self.good2[s][v] = box
+                px[s][v] = p
+                self.last2[s][v] = {"box": tr["box"], "is_right": s == "right", "conf": tr["conf"],
+                                    "global_orient": rot[i], "kp3d": kp3[i], "cam_t": cam_t[i]}
+                tr["box"] = box
+        self.last = self.last2[self.main]
+        self.track = self.tr2[self.main]
+        self.other_fresh = run_other
+        if run_other:
+            self.other = tuple(px[self.other_side])
+        return px[self.main][0], px[self.main][1]
+
     def _sudden(self, ref, box):
         """Keypoint box changed size or moved too much since the last good frame."""
         if ref is None:
@@ -322,6 +461,74 @@ def _selftest():
         ok += 1
     assert ok >= 3, f"only {ok} demo images gave a hand"
     print(f"wilor_landmarks self-test OK ({ok} images)")
+    _selftest_two(imgs)
+
+
+def _selftest_two(imgs):
+    """Two hands: a patch holding one demo hand next to its mirror = a right and a left
+    hand in one frame (same frame in both views). Each side must come back on its half,
+    the left one the mirror of the right, and the left hand only every other_every calls.
+    The demo photos have several hands each, so patches around each confident hand are
+    tried and kept only if they hold exactly one."""
+    lms = StereoLandmarks(hands=2, other_every=2, warmup_size=None)
+    tested = 0
+    for path in imgs:
+        img = cv2.imread(path)
+        if img is None:
+            continue
+        img = cv2.resize(img, (480, int(480 * img.shape[0] / img.shape[1])))
+        h, w0 = img.shape[:2]
+        for (x1, y1, x2, y2), is_right, conf in lms._detect([img], hand="any")[0]:
+            if conf < 0.6:
+                continue
+            cx, cy, half = (x1 + x2) / 2, (y1 + y2) / 2, 0.9 * max(x2 - x1, y2 - y1)
+            patch = np.ascontiguousarray(img[int(max(0, cy - half)):int(min(h, cy + half)),
+                                             int(max(0, cx - half)):int(min(w0, cx + half))])
+            if min(patch.shape[:2]) < 60:
+                continue
+            patch = cv2.resize(patch, (2 * patch.shape[1], 2 * patch.shape[0]))  # small hands
+            if sum(e[2] >= 0.5 for e in lms._detect([patch], hand="any")[0]) != 1:
+                continue
+            right = patch if is_right else patch[:, ::-1].copy()  # the right hand goes left
+            w = right.shape[1]
+            frame = np.hstack([right, right[:, ::-1]])  # right hand in the left half, left in the right
+            if sum(e[2] >= 0.5 for e in lms._detect([frame], hand="any")[0]) != 2:
+                continue  # part of a neighbour hand at the patch edge became a hand at the seam
+            lms.tr2 = {s: [None, None] for s in ("right", "left")}
+            lms.good2 = {s: [None, None] for s in ("right", "left")}
+            lms.other, lms.n = (None, None), 0
+            fresh = []
+            for _ in range(4):
+                m0, _ = lms(frame, frame)
+                fresh.append(lms.other_fresh)
+            o0 = lms.other[0]
+            name = f"{os.path.basename(path)} hand at ({cx:.0f},{cy:.0f})"
+            if m0 is None or o0 is None:
+                print(f"  two hands, {name}: right {'ok' if m0 is not None else 'missing'}, "
+                      f"left {'ok' if o0 is not None else 'missing'}")
+                continue
+            # the main (right) hand must be on the half the detector calls right in this
+            # frame (its class can differ from the photo's: a test of the tracker, not YOLO)
+            fd = [e for e in lms._detect([frame], hand="any")[0] if e[2] >= 0.5]
+            r_half = [(e[0][0] + e[0][2]) / 2 < w for e in fd if e[1]]
+            m_left, o_left = np.median(m0[:, 0]) < w, np.median(o0[:, 0]) < w
+            assert m_left != o_left, f"both hands on one half ({name})"
+            assert not r_half or m_left == r_half[0], f"right hand on the wrong half ({name})"
+            if m_left:  # make the mirror check independent of which half is which
+                mirrored = o0.copy()
+            else:
+                m0, o0 = o0, m0
+                mirrored = o0.copy()
+            mirrored[:, 0] = (2 * w - 1) - mirrored[:, 0]
+            size = max(np.ptp(m0[:, 0]), np.ptp(m0[:, 1]))
+            err = np.median(np.linalg.norm(mirrored - m0, axis=1))
+            assert err < 0.1 * size, f"left hand is not the mirror of the right ({err:.1f} px, {name})"
+            assert fresh == [True, True, False, True], fresh  # other hand: first call, then every 2nd
+            print(f"  two hands, {name}: right + left on their halves, mirror check "
+                  f"{err:.1f} px ({100 * err / size:.1f}% of hand)")
+            tested += 1
+    assert tested >= 3, f"only {tested} demo hands gave two-hand frames"
+    print(f"wilor_landmarks two-hand self-test OK ({tested} hands; left updated on calls 1, 2, 4)")
 
 
 if __name__ == "__main__":

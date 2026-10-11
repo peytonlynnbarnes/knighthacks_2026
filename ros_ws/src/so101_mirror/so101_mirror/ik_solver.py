@@ -13,6 +13,10 @@ Used by scripts/ik_node.py; testable without ROS. Strategy per target:
    last published one (a branch flip, or a glitch in the target) is held back
    until confirm consecutive ticks agree on it.
 
+Two-hand mode: solve(offset, roll_lock=rad) holds wrist_roll at the other hand's
+command and solves position + pitch around it; the orientation target takes its
+roll from the lock, and the branch guard ignores wrist_roll (a commanded change).
+
 There's no separate position-only fallback any more: with limit handling, the
 orientation task already yields to position, so an unreachable pitch comes out
 as the nearest reachable one instead of the gripper swinging free.
@@ -22,7 +26,7 @@ import time
 
 import numpy as np
 
-from so101_mirror.kinematics import rpy_to_matrix, solve_ik
+from so101_mirror.kinematics import matrix_to_rpy, rpy_to_matrix, solve_ik
 
 # IK at home (mid-workspace, gripper level), deg: see model.HOME_OFFSET
 HOME_Q_DEG = (0.0, -51.0, 63.8, -12.8, 0.0)
@@ -44,51 +48,69 @@ class TargetSolver:
         self.pending = []                 # held-back far solutions (branch guard)
         self.rng = np.random.default_rng(seed)
         self.info = {}
+        # wrist_roll -> tool roll in target rpy: same or opposite sign, from the model
+        self.roll_idx = list(chain.active).index("wrist_roll")
+        q1 = self.q_home.copy()
+        q1[self.roll_idx] += 0.1
+        R0, R1 = chain.fk(self.q_home)[:3, :3], chain.fk(q1)[:3, :3]
+        self.roll_sign = float(np.sign(matrix_to_rpy(R1 @ R0.T)[0]))
 
-    def target_pose(self, offset):
-        """Absolute (p, R or None) for an offset from home, yaw freed if set."""
+    def target_pose(self, offset, roll_lock=None):
+        """Absolute (p, R or None) for an offset from home, yaw freed if set; with
+        roll_lock (wrist_roll, rad) the roll is the one that joint angle gives."""
         p = self.home_p + np.asarray(offset[:3], dtype=float)
         if not self.use_orientation:
             return p, None
         roll, pitch, yaw = offset[3:6]
+        if roll_lock is not None:
+            roll = self.roll_sign * roll_lock
         if self.free_yaw:
             yaw = math.atan2(p[1] - self.pan_xy[1], p[0] - self.pan_xy[0])
         return p, rpy_to_matrix(roll, pitch, yaw) @ self.home_R
 
-    def _ik(self, p, R, q0, iters):
+    def _ik(self, p, R, q0, iters, lock=None):
         posture = dict(q_rest=self.q_home) if R is None else {}
-        return solve_ik(self.chain, p, R, q0=q0, max_iters=iters,
+        return solve_ik(self.chain, p, R, q0=q0, max_iters=iters, lock=lock,
                         rot_weight=self.rot_weight, rot_damping=self.rot_damping, **posture)
 
     def _score(self, r):
         return r.rot_err + 0.5 * float(np.max(np.abs(r.q - self.q)))
 
-    def solve(self, offset):
-        """Joint angles (5,) to publish, or None to hold. self.info explains."""
+    def solve(self, offset, roll_lock=None):
+        """Joint angles (5,) to publish, or None to hold. self.info explains.
+        roll_lock: hold wrist_roll at this angle (rad, clipped to its limits)."""
         t0 = time.perf_counter()
-        p, R = self.target_pose(offset)
-        best = self._ik(p, R, self.q, 60)
+        lock = None
+        if roll_lock is not None:
+            i = self.roll_idx
+            roll_lock = float(np.clip(roll_lock, self.chain.lower[i], self.chain.upper[i]))
+            lock = {i: roll_lock}
+        p, R = self.target_pose(offset, roll_lock)
+        best = self._ik(p, R, self.q, 60, lock)
         how = "warm"
         if best.pos_err > self.tol:
             wrist_relaxed = self.q.copy()
             wrist_relaxed[3] = 0.0
             seeds = [self.q_home, wrist_relaxed]
-            cands = [r for r in (self._ik(p, R, s, 100) for s in seeds) if r.pos_err <= self.tol]
+            cands = [r for r in (self._ik(p, R, s, 100, lock) for s in seeds) if r.pos_err <= self.tol]
             while not cands and time.perf_counter() - t0 < self.budget:
-                r = self._ik(p, R, self.rng.uniform(self.chain.lower, self.chain.upper), 100)
+                r = self._ik(p, R, self.rng.uniform(self.chain.lower, self.chain.upper), 100, lock)
                 if r.pos_err <= self.tol:
                     cands.append(r)
             if cands:
                 best, how = min(cands, key=self._score), "reseeded"
         self.info = dict(how=how, pos_err=best.pos_err, rot_err=best.rot_err,
-                         ms=(time.perf_counter() - t0) * 1000)
+                         ms=(time.perf_counter() - t0) * 1000, roll_lock=roll_lock)
         if best.pos_err > self.tol:
             self.info["how"] = "unreachable"
             self.pending = []
             return None
-        if float(np.max(np.abs(best.q - self.q))) > self.jump:
+        guarded = np.ones(len(best.q), dtype=bool)
+        if lock:
+            guarded[self.roll_idx] = False  # a commanded roll change isn't a branch flip
+        if float(np.max(np.abs(best.q - self.q)[guarded])) > self.jump:
             # far jump: accept only once `confirm` consecutive ticks agree
-            if self.pending and float(np.max(np.abs(best.q - self.pending[-1]))) > self.jump:
+            if self.pending and float(np.max(np.abs(best.q - self.pending[-1])[guarded])) > self.jump:
                 self.pending = []
             self.pending.append(best.q)
             if len(self.pending) < self.confirm:
@@ -97,3 +119,49 @@ class TargetSolver:
         self.pending = []
         self.q = best.q
         return best.q
+
+
+def _selftest():
+    """Roll lock on the real chain + soft limits: wrist_roll stays at the command, position
+    stays solved, pitch still follows; no lock = unchanged; locked roll changes pass the guard."""
+    from so101_mirror.model import (HW_LIMITS_FILE, apply_limits, hardware_limits, home_pose,
+                                    load_chain)
+    chain = load_chain()
+    apply_limits(chain, hardware_limits(HW_LIMITS_FILE))
+    home_p, home_R = home_pose(chain)
+    rng = np.random.default_rng(1)
+    i = list(chain.active).index("wrist_roll")
+    worst = dict(roll=0.0, pos=0.0, pos_free=0.0)
+    n_ok = n_free_ok = 0
+    for _ in range(60):
+        off = np.r_[rng.uniform([-0.08, -0.12, -0.06], [0.08, 0.12, 0.08]), 0.0,
+                    rng.uniform(-0.6, 0.9), 0.0]
+        lock = rng.uniform(-1.5, 0.8)
+        a, b = (TargetSolver(chain, home_p, home_R, jump_deg=360.0) for _ in range(2))  # guard: below
+        qa, qb = a.solve(off, roll_lock=lock), b.solve(off)
+        if qa is not None:
+            n_ok += 1
+            worst["roll"] = max(worst["roll"], abs(qa[i] - lock))
+            worst["pos"] = max(worst["pos"], a.info["pos_err"])
+        if qb is not None:
+            n_free_ok += 1
+            worst["pos_free"] = max(worst["pos_free"], b.info["pos_err"])
+    assert worst["roll"] < 1e-9, worst
+    assert worst["pos"] <= 0.01 and worst["pos_free"] <= 0.01, worst
+    assert n_ok >= 0.9 * n_free_ok, (n_ok, n_free_ok)
+    # the orientation target uses the locked roll: at home, a locked roll gives no rot error
+    s = TargetSolver(chain, home_p, home_R)
+    q = s.solve(np.zeros(6), roll_lock=0.5)
+    assert q is not None and s.info["rot_err"] < 0.02, s.info
+    # sweeping the locked roll 0 -> -1.4 rad in one step isn't held back as a branch flip
+    s = TargetSolver(chain, home_p, home_R)
+    s.solve(np.zeros(6), roll_lock=0.0)
+    q = s.solve(np.zeros(6), roll_lock=-1.4)
+    assert q is not None and abs(q[i] + 1.4) < 1e-9, s.info
+    print(f"ik_solver self-test OK: roll lock exact, {n_ok}/{n_free_ok} targets solved (locked/free), "
+          f"pos err max {worst['pos'] * 1000:.2f} / {worst['pos_free'] * 1000:.2f} mm, "
+          f"roll sign {s.roll_sign:+.0f}")
+
+
+if __name__ == "__main__":
+    _selftest()

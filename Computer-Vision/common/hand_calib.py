@@ -32,6 +32,7 @@ calib/hand_wilor.json is a record of the last one, not reloaded.
 The axes depend on how the cameras are mounted, so redo it if they move.
 """
 import json
+import math
 import os
 from collections import deque
 
@@ -66,10 +67,12 @@ class HandCalibrator:
 
     UP_MIN_ANGLE = 60.0     # measured up must be at least this far from forward (deg)
 
-    def __init__(self, frame="fit", range_steps=True, up_step=False):
+    def __init__(self, frame="fit", range_steps=True, up_step=False, roll_step=True):
         self.frame = frame    # how tracking computes the hand rotation (StereoHand frame=)
         self.range_steps = range_steps
         self.up_step = up_step
+        if not roll_step:  # two-hand mode: the left hand turns wrist_roll (LeftHandCalibrator)
+            self.RANGE_STEPS = tuple(r for r in HandCalibrator.RANGE_STEPS if r[0] != "ROLL")
         self.step = "NEUTRAL"
         self.buf = deque()
         self.result = None
@@ -235,6 +238,87 @@ class HandCalibrator:
         return True
 
 
+class LeftHandCalibrator:
+    """Two-hand mode (TWO_HAND_PLAN.md): the left hand, which turns wrist_roll and works the
+    gripper. Runs after the right hand's calibration, while the right hand already drives
+    the arm. Fed the left hand's stereo pose per frame.
+     1. LEFT: left hand flat, palm to the cameras, hold still 2 s -> bones, palm template,
+        flat-hand curl (gripper fully open), neutral rotation.
+     2. LEFT_ROLL: roll it CLOCKWISE a quarter turn, then back -> the sign of a clockwise
+        twist about `axis` (camera frame; the node sets the robot's forward axis from the
+        right-hand calibration), or about the hand's finger axis if None. The node's
+        RollFilter measures about the same axis.
+    """
+    HOLD_S, STILL_M = HandCalibrator.HOLD_S, HandCalibrator.STILL_M
+    ROLL_MIN_DEG = 30.0   # the roll counts once it turned this far...
+    ROLL_BACK = 0.5       # ...and came back below this fraction of its peak
+    ROLL_TIMEOUT_S = 12.0
+
+    def __init__(self, axis=None):
+        self.axis = axis
+        self.step, self.buf, self.result, self.msg = "LEFT", deque(), None, ""
+        self._peak, self._t0, self._recent = 0.0, None, deque(maxlen=3)
+
+    def instructions(self):
+        head = {"LEFT": "LEFT 1/2: left hand flat, palm to cameras, hold still 2 s",
+                "LEFT_ROLL": "LEFT 2/2: slowly ROLL the left hand CLOCKWISE a quarter turn (doorknob), then back",
+                "DONE": "left hand calibrated"}[self.step]
+        return head + (f"  [{self.msg}]" if self.msg else "")
+
+    def feed(self, pose, t):
+        """Returns True once done (self.result: bones, template, open_curl, neutral_R,
+        cw_sign = sign of a clockwise twist, roll_deg = how far it turned)."""
+        if pose is None or pose["mode"] != "stereo":
+            if self.step == "LEFT":
+                self.buf.clear()
+            return False
+        if self.step == "LEFT":
+            self.buf.append((t, pose))
+            while self.buf and t - self.buf[0][0] > self.HOLD_S:
+                self.buf.popleft()
+            if len(self.buf) < 5 or t - self.buf[0][0] < 0.9 * self.HOLD_S:
+                return False
+            if float(np.max(np.std([b[1]["p"] for b in self.buf], axis=0))) >= self.STILL_M:
+                return False
+            poses = [b[1] for b in self.buf]
+            P = np.median(np.array([q["P"] for q in poses]), axis=0)
+            width = np.linalg.norm(P[5] - P[17])
+            if not 0.03 < width < 0.20:
+                self.msg = f"palm width {width * 100:.0f} cm is implausible, retrying"
+                self.buf.clear()
+                return False
+            self.bones = np.median([h3.bone_lengths(q["P"]) for q in poses], axis=0)
+            self.template = h3.palm_template(P)
+            curls = [q["curl"] for q in poses if q["curl"] is not None]
+            self.open_curl = float(np.median(curls)) if curls else None
+            self.neutral_R = h3.project_to_so3(np.mean(
+                [h3.palm_fit(q["P"][h3.PALM], self.template)[1] for q in poses], axis=0))
+            self.msg = f"palm width {width * 100:.1f} cm"
+            self.step, self._t0 = "LEFT_ROLL", t
+            return False
+        if self.step == "LEFT_ROLL":
+            R = h3.palm_fit(pose["P"][h3.PALM], self.template)[1]
+            tw = (h3.twist_x(self.neutral_R.T @ R) if self.axis is None
+                  else h3.twist_about(R @ self.neutral_R.T, self.axis))
+            self._recent.append(math.degrees(tw))
+            a = float(np.median(self._recent))  # one-frame spikes don't set the peak
+            if abs(a) > abs(self._peak):
+                self._peak = a
+            back = abs(self._peak) >= self.ROLL_MIN_DEG and abs(a) < self.ROLL_BACK * abs(self._peak)
+            if back or t - self._t0 > self.ROLL_TIMEOUT_S:
+                if abs(self._peak) < self.ROLL_MIN_DEG:  # timed out without a roll: try again
+                    self.msg = f"only {abs(self._peak):.0f} deg: roll a full quarter turn"
+                    self._peak, self._t0 = 0.0, t
+                    return False
+                self.step = "DONE"
+                self.result = dict(bones=self.bones, template=self.template, open_curl=self.open_curl,
+                                   neutral_R=self.neutral_R, cw_sign=float(np.sign(self._peak)),
+                                   roll_deg=abs(self._peak))
+                self.msg = f"clockwise = {'+' if self._peak > 0 else '-'}twist, {abs(self._peak):.0f} deg"
+                return True
+        return False
+
+
 def save_hand(res, path=HAND_PATH):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     with open(path, "w") as f:
@@ -310,6 +394,31 @@ def _selftest():
         assert (err < want_err) if up_step else (err > want_err), (up_step, err)
         print(f"  cameras 20 deg off level, up step {'on ' if up_step else 'off'}: robot up off by {err:.1f} deg"
               + (f"  [{cal.msg}]" if up_step else ""))
+
+    # two-hand mode: right-hand calibration without the roll step; left hand calibration
+    cal = HandCalibrator("fit", range_steps=True, roll_step=False)
+    assert [r[0] for r in cal.RANGE_STEPS] == ["TILT_A", "TILT_B"] and HandCalibrator.RANGE_STEPS[0][0] == "ROLL"
+    lc, t[0] = LeftHandCalibrator(axis=(0.0, 0.0, -1.0)), 0.0
+    left0 = hand0.copy()
+    left0[:, 0] *= -1  # mirror: a left hand
+    lbase = np.array([-0.15, 0.0, 0.55])
+
+    def lpose(twist_deg=0.0):
+        Rh = h3.rotvec_to_matrix(np.radians(twist_deg) * np.array([0.0, 0.0, -1.0]))  # about the axis
+        P = (left0 - h3.palm_center(left0)) @ Rh.T + lbase + rng.normal(0, 0.0015, left0.shape)
+        o, R = h3.hand_frame(P)
+        return dict(P=P, p=o, R=R, mode="stereo", curl=h3.curl(P))
+
+    for k in range(int(2.5 * 30)):
+        lc.feed(lpose(), t[0]); t[0] += 1 / 30
+    assert lc.step == "LEFT_ROLL", lc.step
+    for k in range(int(3.0 * 30)):  # quarter turn one way and back
+        done = lc.feed(lpose(90 * math.sin(math.pi * k / 90)), t[0]); t[0] += 1 / 30
+        if done:
+            break
+    assert lc.step == "DONE" and lc.result["cw_sign"] == 1.0 and abs(lc.result["roll_deg"] - 90) < 8, \
+        (lc.step, lc.result)
+    print(f"  left hand calibration OK: twist sign {lc.result['cw_sign']:+.0f}, {lc.result['roll_deg']:.0f} deg")
 
 
 if __name__ == "__main__":

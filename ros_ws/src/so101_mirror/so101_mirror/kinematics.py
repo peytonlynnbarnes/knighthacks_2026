@@ -187,8 +187,12 @@ def _dls(J, damping):
 
 def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
              max_iters=150, pos_tol=1e-4, damping=0.005, rot_weight=0.5,
-             posture_gain=0.1, max_step=0.2, rot_damping=None):
+             posture_gain=0.1, max_step=0.2, rot_damping=None, lock=None):
     """Task-priority IK. R_target=None means position only.
+
+    lock: {joint index: angle (rad)}: those joints are held at that angle (clipped to
+    their limits) and the others solve around them (two-hand mode: the other hand sets
+    wrist_roll).
 
     rot_damping: damping of the orientation (secondary) task, default `damping`.
     Larger values trade orientation accuracy for smoothness where the target
@@ -199,6 +203,9 @@ def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
     n = len(chain.active)
     q = np.zeros(n) if q0 is None else np.array(q0, dtype=float)
     q = np.clip(q, chain.lower, chain.upper)
+    locked = np.zeros(n, dtype=bool)
+    for i, a in (lock or {}).items():
+        q[i], locked[i] = np.clip(a, chain.lower[i], chain.upper[i]), True
     q_rest = np.zeros(n) if q_rest is None else np.asarray(q_rest, dtype=float)
     p_target = np.asarray(p_target, dtype=float)
     I = np.eye(n)
@@ -211,7 +218,7 @@ def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
         # further out is frozen (its column removed) and the step re-solved with
         # the others. Plain clipping instead leaves the tasks fighting the limit,
         # which stalls the solve and drives the random-restart branch flips.
-        free = np.ones(n, dtype=bool)
+        free = ~locked
         for _ in range(n):
             Jf = J * free
             Jp, Jw = Jf[:3], Jf[3:]
@@ -227,6 +234,7 @@ def solve_ik(chain, p_target, R_target=None, q0=None, q_rest=None,
             if not stuck.any():
                 break
             free &= ~stuck
+        dq[locked] = 0.0
         step = np.max(np.abs(dq))
         if step > max_step:
             dq *= max_step / step

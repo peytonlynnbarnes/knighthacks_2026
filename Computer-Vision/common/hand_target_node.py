@@ -88,14 +88,16 @@ import numpy as np
 
 import hand3d as h3
 from frames import FrameRecorder, FrameReplay, ReplayEnd
-from hand_calib import HandCalibrator, hand_path, save_hand
-from hand_mapping import (BOX_MIN, IMM_PRESETS, KALMAN_DEFAULTS, GripFilter, HandMapper, RotationShaper, StereoIMM,
-                          StereoKalman, StillHold, gains_from_range)
+from hand_calib import HandCalibrator, LeftHandCalibrator, hand_path, save_hand
+from hand_mapping import (BOX_MIN, IMM_PRESETS, KALMAN_DEFAULTS, GripFilter, HandMapper, RollFilter, RotationShaper,
+                          StereoIMM, StereoKalman, StillHold, facing_weight, gains_from_range)
 from stereo_cam import (BACKENDS, DEFAULT_CAMS, RIG_PATH, StereoCam, draw_hand, fit_view, load_rig,
                         make_landmarks)
 
 BALL_TOPIC = "/ball_position"  # must match so101_mirror.BALL_TOPIC
 GRIP_TOPIC = "/gripper"        # std_msgs/Float64, 0 = open .. 1 = closed (feetech_mirror --gripper)
+WRIST_ROLL_TOPIC = "/wrist_roll_cmd"  # std_msgs/Float64 rad, two-hand mode; must match so101_mirror
+LEFT_COLOR = (0, 140, 255)     # BGR orange: the left hand in the preview (two-hand mode)
 GRIP_TAU = 0.04                # s, time constant of the grip smoothing (was 0.5 per frame ~ 25 fps)
 ROLL_GAIN = (1.5, 1.5)         # (neg, pos) when the range calibration didn't measure the roll
 PITCH_GAIN = (1.0, 2.0)        # (up, down) likewise
@@ -115,6 +117,7 @@ class Publisher:
         self.node = rclpy.create_node("hand_target_node")
         self.pub = self.node.create_publisher(Float64MultiArray, BALL_TOPIC, 10)
         self.grip_pub = self.node.create_publisher(Float64, GRIP_TOPIC, 10)
+        self.roll_pub = self.node.create_publisher(Float64, WRIST_ROLL_TOPIC, 10)
 
     def __call__(self, target):
         if self.node is not None:
@@ -123,6 +126,10 @@ class Publisher:
     def grip(self, v):
         if self.node is not None:
             self.grip_pub.publish(self.F64(data=float(v)))
+
+    def roll(self, v):
+        if self.node is not None:
+            self.roll_pub.publish(self.F64(data=float(v)))
 
     def close(self):
         if self.node is not None:
@@ -370,7 +377,14 @@ def main():
                          "backend was busy (fair speed comparison; otherwise every pair is processed)")
     ap.add_argument("--reanchor-s", type=float, default=0.3,
                     help="hand hidden at least this long (s) -> re-anchor when it returns")
+    ap.add_argument("--two-hands", action="store_true",
+                    help="right hand = position + pitch, left hand = wrist_roll (/wrist_roll_cmd) + "
+                         "gripper (TWO_HAND_PLAN.md); after the right-hand calibration, 2 left-hand steps")
+    ap.add_argument("--roll-sign", type=float, default=1.0, choices=[1.0, -1.0],
+                    help="two hands: -1 if wrist_roll turns the opposite way to the left hand")
     args = ap.parse_args()
+    if args.two_hands and (args.record or args.replay):
+        raise SystemExit("--two-hands: --record / --replay store one hand; use --record-frames / --replay-frames")
     if args.replay:
         args.no_view = True
     if args.replay and args.replay_frames:
@@ -387,9 +401,19 @@ def main():
     print(f"stereo rig: {args.rig} ({rig['method']}), {size[0]}x{size[1]}, baseline "
           f"{np.linalg.norm(rig['t']) * 100:.1f} cm")
     calib, mapper, grip_f = None, None, None
+    # two hands: the left hand's own estimator / calibration / roll + grip filters
+    two = args.two_hands
+    est_l = h3.StereoHand(rig, reproj_px=args.reproj_px, mono_fallback=False, frame=args.frame,
+                          fit_mm=args.fit_mm, jump_deg=args.jump_deg) if two else None
+    lcal = LeftHandCalibrator() if two else None
+    roll_f = grip_l = None
+    left_axis = None  # robot forward in cam coords (right-hand calibration): the left roll's axis
 
     def start_tracking(res):
-        nonlocal mapper, grip_f
+        nonlocal mapper, grip_f, left_axis
+        left_axis = np.asarray(res["A"], float)[0]
+        if lcal is not None:
+            lcal.axis = left_axis
         grip_open = GRIP_OPEN_CURL
         est.set_hand(res["bones"], res["template"])
         if args.grip_open_curl is not None:
@@ -437,7 +461,7 @@ def main():
         if old is not None:  # recalibration: continue (speed-limited) from the current target
             mapper.cur_p, mapper.cur_R, mapper.cur_t = old.cur_p, old.cur_R, old.cur_t
 
-    calib = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up)  # every run: calibration hand = origin
+    calib = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up, not args.two_hands)  # every run: calibration hand = origin
 
     pub = Publisher(not args.no_ros)
     replay = Replay(args.replay, realtime=not args.no_ros) if args.replay else None
@@ -456,7 +480,8 @@ def main():
     else:
         # backend first: WiLoR takes ~15 s to load, and missing packages fail before the cameras open
         lms = make_landmarks(args.backend, hand=args.wilor_hand, yolo_every=args.wilor_yolo_every,
-                             fp32=args.wilor_fp32, warmup_size=size)  # MPS compiles per input shape
+                             fp32=args.wilor_fp32, warmup_size=size,  # MPS compiles per input shape
+                             hands=2 if two else 1)
         print(f"landmarks: {args.backend}")
         if args.replay_frames:
             cam = FrameReplay(args.replay_frames, realtime=not args.no_ros and not args.replay_live,
@@ -467,14 +492,65 @@ def main():
             cam = StereoCam(args.cams, size=size)  # the intrinsics only hold at the calibrated size
             print("cameras:", cam.configure())
     skew = None if args.no_skew_correct else h3.SkewCorrector()
+    skew_l = None if args.no_skew_correct or not two else h3.SkewCorrector()
     lost_since, grip = None, None  # when the hand disappeared; filtered grip 0..1
     last_print, fps_n, fps_t, fps = 0.0, 0, time.monotonic(), 0.0
     target, why = None, ""
     jitter = Jitter()
 
+    def start_left(res):
+        """Left-hand calibration done: roll + grip filters (a recalibration keeps both commands)."""
+        nonlocal roll_f, grip_l
+        est_l.set_hand(res["bones"], res["template"])
+        grip_open = args.grip_open_curl if args.grip_open_curl is not None else (
+            res["open_curl"] * GRIP_OPEN_MARGIN if res["open_curl"] is not None else GRIP_OPEN_CURL)
+        grip_open = max(grip_open, args.grip_closed_curl + 0.15)
+        old_roll = roll_f.cmd if roll_f is not None else 0.0
+        # a clockwise hand turn = gripper roll + (as one-handed) = wrist_roll - (tool roll =
+        # -wrist_roll, ik_solver.roll_sign); --roll-sign -1 flips it if the arm disagrees
+        roll_f = RollFilter(sign=-res["cw_sign"] * args.roll_sign, start=old_roll, axis=left_axis)
+        old_grip = grip_l.grip if grip_l is not None else None
+        grip_l = GripFilter(grip_open, args.grip_closed_curl, hold_deg=args.grip_hold_deg,
+                            band=args.grip_band, tau=GRIP_TAU, max_dt=HandMapper.MAX_DT)
+        grip_l.grip = old_grip
+        print(f"left hand: wrist_roll from its twist ({lcal.msg}), gripper open at curl >= {grip_open:.2f}, "
+              f"closed at <= {args.grip_closed_curl:.2f}", flush=True)
+
+    def process_left(t):
+        """Two hands: the left hand -> wrist_roll + gripper. Returns ((px0, px1), status)."""
+        nonlocal lcal
+        l0, l1 = lms.other if lms.other_fresh else (None, None)
+        lpose = None
+        if lms.other_fresh:
+            l1s = l1 if skew_l is None else skew_l(l1, cam.t1, cam.t0)
+            lpose, _ = est_l.estimate(l0, l1s, t)
+        if calib is not None:
+            return (l0, l1), "left: calibrates after the right hand"
+        if lcal is not None:
+            if not lcal.feed(lpose, t):
+                return (l0, l1), lcal.instructions()
+            start_left(lcal.result)
+            lcal = None
+        if lpose is not None and lpose["mode"] == "stereo":
+            palm = facing_weight(lpose["p"], lpose["R"])[1]
+            cmd, st = roll_f.update(lpose["R"], lpose["curl"], palm, t)
+            g = grip_l(lpose["curl"], palm, t)
+            if g is not None:
+                pub.grip(g)
+            line = f"LEFT {st:<6} roll {math.degrees(cmd):+4.0f} deg" + (
+                f"  grip {g:.2f}{'H' if grip_l.held else ' '}" if g is not None else "")
+        else:
+            if lms.other_fresh:
+                roll_f.lost(t)
+            line = f"LEFT none   roll {math.degrees(roll_f.cmd):+4.0f} deg (holding)"
+        pub.roll(roll_f.cmd)  # every pair, also while hidden: the IK keeps wrist_roll locked
+        return (l0, l1), line
+
     def recalibrate():
-        nonlocal calib, target
-        calib, target = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up), None  # stops publishing
+        nonlocal calib, target, lcal
+        calib, target = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up, not args.two_hands), None  # stops publishing
+        if two:
+            lcal = LeftHandCalibrator(axis=left_axis)  # start_tracking updates it after the right hand
         for r in (rec, frec):
             if r is not None:
                 r.mark_recal()
@@ -525,7 +601,7 @@ def main():
             published = True
             status = f"TRACKING [{pose['mode']}]"
             # mono (no curl) or palm turned away -> the gripper holds
-            grip = grip_f(pose["curl"], mapper.palm_angle, t)
+            grip = None if two else grip_f(pose["curl"], mapper.palm_angle, t)  # two hands: the left's
             if grip is not None:
                 pub.grip(grip)
                 curl_s = "  -- " if pose["curl"] is None else f"{pose['curl']:.2f}"
@@ -539,6 +615,8 @@ def main():
                 log.add(t, 2)
             jitter.clear()
             status = f"no hand (clutch: holding): {why}"
+
+        left_px, left_line = process_left(t) if two else ((None, None), "")
 
         if time.monotonic() - last_print > 0.5:
             last_print = time.monotonic()
@@ -554,21 +632,23 @@ def main():
                 jit = jitter.read()
                 if jit is not None:
                     line += f"  jitter {jit[0]:4.1f} mm {jit[1]:4.1f} deg"
-            print(line, flush=True)
+            print(line + (f"  | {left_line}" if two else ""), flush=True)
 
         if replaying and cam.recalibrate_now():
-            calib, target = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up), None
+            calib, target = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up, not args.two_hands), None
         fps_n += 1
         if time.monotonic() - fps_t > 1.0:
             fps, fps_n, fps_t = fps_n / (time.monotonic() - fps_t), 0, time.monotonic()
         return dict(f0=f0, f1=f1, px0=px0, px1=px1_raw, pose=pose, status=status, fps=fps,
                     skew_ms=(cam.t1 - cam.t0) * 1000,
-                    target=target if calib is None else None)
+                    target=target if calib is None else None, left_px=left_px, left_line=left_line)
 
     def show(f0, f1, snap, cam_fps=None):
         """Draw snap's landmarks / pose / text on f0, f1 and show them. Returns the key."""
         draw_hand(f0, snap["px0"])
         draw_hand(f1, snap["px1"])
+        draw_hand(f0, snap["left_px"][0], LEFT_COLOR)
+        draw_hand(f1, snap["left_px"][1], LEFT_COLOR)
         if snap["pose"] is not None:
             draw_axes(f0, snap["pose"], rig["K0"], rig["d0"])
         view = np.hstack([f0, f1])
@@ -580,6 +660,8 @@ def main():
             lines.append(f"offset cm x{x * 100:+.1f} y{y * 100:+.1f} z{z * 100:+.1f}  "
                          f"rpy deg {math.degrees(r):+.0f} {math.degrees(p):+.0f} "
                          f"{math.degrees(yw):+.0f}")
+        if snap["left_line"]:
+            lines.append(snap["left_line"])
         for i, s in enumerate(lines):
             cv2.putText(view, s, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                         (0, 0, 255) if snap["pose"] is None else (0, 255, 255), 2)

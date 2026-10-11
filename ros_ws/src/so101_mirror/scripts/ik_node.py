@@ -8,6 +8,9 @@ Input:  /ball_position  std_msgs/Float64MultiArray [x, y, z, roll, pitch, yaw]
         xyz: meters along the base_link axes (+X forward, +Y left, +Z up).
         rpy: rotation (base_link axes, R = Rz Ry Rx) applied to the home
         gripper orientation. Target = (home_p + xyz, R(rpy) @ home_R).
+        /wrist_roll_cmd std_msgs/Float64, rad (optional, two-hand mode): while
+                fresh (< stale_s) wrist_roll is held at it and the other joints
+                solve position + pitch around it
 Output: /arm/shoulder_pan, /arm/shoulder_lift, /arm/elbow_flex,
         /arm/wrist_flex, /arm/wrist_roll   std_msgs/Float64, radians (URDF)
 
@@ -72,7 +75,7 @@ import rclpy
 from rclpy.node import Node
 from std_msgs.msg import Float64, Float64MultiArray
 
-from so101_mirror import ARM_JOINTS, ARM_TOPIC_PREFIX, BALL_TOPIC
+from so101_mirror import ARM_JOINTS, ARM_TOPIC_PREFIX, BALL_TOPIC, WRIST_ROLL_TOPIC
 from so101_mirror.ik_solver import TargetSolver
 from so101_mirror.target_filter import TargetInterpolator
 from so101_mirror.model import (HW_LIMITS_FILE, apply_limits, default_urdf_path, hardware_limits,
@@ -126,10 +129,23 @@ class IKNode(Node):
         self.pubs = {j: self.create_publisher(Float64, ARM_TOPIC_PREFIX + j, 10)
                      for j in ARM_JOINTS}
         self.create_subscription(Float64MultiArray, BALL_TOPIC, self.on_target, 10)
+        self.roll_cmd = None  # (rad, time) from WRIST_ROLL_TOPIC
+        self.create_subscription(Float64, WRIST_ROLL_TOPIC, self.on_roll, 10)
         self.create_timer(1.0 / gp("rate"), self.tick)
         self.get_logger().info(f"IK ready: {BALL_TOPIC} (offset from home EE "
                                f"{np.round(self.home_p, 4)}) -> {ARM_TOPIC_PREFIX}<joint>, "
                                f"limits lo={np.round(self.chain.lower, 2)} hi={np.round(self.chain.upper, 2)}")
+
+    def on_roll(self, msg):
+        if math.isfinite(msg.data):
+            self.roll_cmd = (float(msg.data), self.get_clock().now())
+
+    def roll_lock(self):
+        """The other hand's wrist_roll command while fresh, else None (IK picks the roll)."""
+        if self.roll_cmd is None:
+            return None
+        age = (self.get_clock().now() - self.roll_cmd[1]).nanoseconds * 1e-9
+        return self.roll_cmd[0] if age <= self.get_parameter("stale_s").value else None
 
     def on_target(self, msg):
         d = np.array(msg.data, dtype=float)
@@ -159,7 +175,7 @@ class IKNode(Node):
             self.get_logger().warn(f"target stale ({age:.1f} s), holding", throttle_duration_sec=5.0)
             return
         target = self.interp.sample(self.get_clock().now().nanoseconds * 1e-9)
-        q = self.solver.solve(target)
+        q = self.solver.solve(target, roll_lock=self.roll_lock())
         info = self.solver.info
         if q is None:
             p = self.home_p + target[:3]
@@ -172,7 +188,9 @@ class IKNode(Node):
         self.get_logger().info(
             "q(deg)=" + " ".join(f"{j}:{math.degrees(v):+.0f}" for j, v in zip(ARM_JOINTS, q))
             + f"  pos_err={info['pos_err'] * 1000:.1f}mm rot_err={math.degrees(info['rot_err']):.0f}deg"
-            f" [{info['how']}, {info['ms']:.0f} ms]",
+            f" [{info['how']}, {info['ms']:.0f} ms"
+            + ("" if info["roll_lock"] is None else f", roll locked {math.degrees(info['roll_lock']):+.0f}")
+            + "]",
             throttle_duration_sec=2.0)
 
 
