@@ -320,6 +320,9 @@ def main():
     ap.add_argument("--mono-fallback", action="store_true",
                     help="track the palm from one camera when the other loses the hand")
     ap.add_argument("--no-view", action="store_true", help="no preview window")
+    ap.add_argument("--calib-up", action="store_true",
+                    help="hand calibration: add a 'move ~15 cm straight up' step after forward, so robot up "
+                         "comes from the hand instead of assuming level cameras (prints the camera tilt)")
     ap.add_argument("--grip-open-curl", type=float, default=None,
                     help="finger curl (palm lengths) that counts as fully open "
                          f"(default: from the hand calibration's flat hand, else {GRIP_OPEN_CURL})")
@@ -434,7 +437,7 @@ def main():
         if old is not None:  # recalibration: continue (speed-limited) from the current target
             mapper.cur_p, mapper.cur_R, mapper.cur_t = old.cur_p, old.cur_R, old.cur_t
 
-    calib = HandCalibrator(args.frame, not args.no_range_calib)  # every run: calibration hand = origin
+    calib = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up)  # every run: calibration hand = origin
 
     pub = Publisher(not args.no_ros)
     replay = Replay(args.replay, realtime=not args.no_ros) if args.replay else None
@@ -453,7 +456,7 @@ def main():
     else:
         # backend first: WiLoR takes ~15 s to load, and missing packages fail before the cameras open
         lms = make_landmarks(args.backend, hand=args.wilor_hand, yolo_every=args.wilor_yolo_every,
-                             fp32=args.wilor_fp32)
+                             fp32=args.wilor_fp32, warmup_size=size)  # MPS compiles per input shape
         print(f"landmarks: {args.backend}")
         if args.replay_frames:
             cam = FrameReplay(args.replay_frames, realtime=not args.no_ros and not args.replay_live,
@@ -471,7 +474,7 @@ def main():
 
     def recalibrate():
         nonlocal calib, target
-        calib, target = HandCalibrator(args.frame, not args.no_range_calib), None  # stops publishing
+        calib, target = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up), None  # stops publishing
         for r in (rec, frec):
             if r is not None:
                 r.mark_recal()
@@ -554,7 +557,7 @@ def main():
             print(line, flush=True)
 
         if replaying and cam.recalibrate_now():
-            calib, target = HandCalibrator(args.frame, not args.no_range_calib), None
+            calib, target = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up), None
         fps_n += 1
         if time.monotonic() - fps_t > 1.0:
             fps, fps_n, fps_t = fps_n / (time.monotonic() - fps_t), 0, time.monotonic()

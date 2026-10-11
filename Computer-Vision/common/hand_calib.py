@@ -9,6 +9,9 @@ Steps (instructions are shown in the preview window):
  2. FORWARD: move the hand ~15 cm in the arm's forward direction (+X, the
     way the gripper points at home) and hold. That direction + image-up
     (cameras mounted level) define the camera -> robot axes.
+ 2b. UP (opt-in, up_step=True / hand_target_node --calib-up): from there, move the
+    hand ~15 cm straight UP and hold. Robot up then comes from the hand instead of
+    image-up, so tilted cameras don't mix up/down into forward/back.
  3. RETURN: bring the hand back near the start.
  4-6. RANGE (skipped with range_steps=False):
     4. ROLL: one direction only: turn the flat hand a quarter turn (90 deg)
@@ -61,9 +64,12 @@ class HandCalibrator:
     # (step, axis index in robot rpy, which sign: "a" = whichever comes first, "b" = opposite)
     RANGE_STEPS = (("ROLL", 0, "a"), ("TILT_A", 1, "a"), ("TILT_B", 1, "b"))
 
-    def __init__(self, frame="fit", range_steps=True):
+    UP_MIN_ANGLE = 60.0     # measured up must be at least this far from forward (deg)
+
+    def __init__(self, frame="fit", range_steps=True, up_step=False):
         self.frame = frame    # how tracking computes the hand rotation (StereoHand frame=)
         self.range_steps = range_steps
+        self.up_step = up_step
         self.step = "NEUTRAL"
         self.buf = deque()
         self.result = None
@@ -80,17 +86,22 @@ class HandCalibrator:
         return float(np.max(np.std(ps, axis=0))) < self.STILL_M
 
     def instructions(self):
-        n = 7 if self.range_steps else 3
-        return {
-            "NEUTRAL": f"CALIB 1/{n}: open hand, palm to cameras, hold still 2 s",
-            "FORWARD": f"CALIB 2/{n}: move hand ~15 cm in the ARM's forward (+X) direction, hold",
-            "RETURN": f"CALIB 3/{n}: bring hand back to the start position",
-            "ROLL": f"CALIB 4/{n}: flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back",
-            "TILT_A": f"CALIB 5/{n}: slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back",
-            "TILT_B": f"CALIB 6/{n}: now TILT the other way as far as it tracks, then back",
-            "FINAL": f"CALIB 7/{n}: hand back at the start, palm to cameras",
-            "DONE": "calibrated",
-        }[self.step] + (f"  [{self.msg}]" if self.msg else "")
+        steps = ["NEUTRAL", "FORWARD"] + (["UP"] if self.up_step else []) + ["RETURN"]
+        if self.range_steps:
+            steps += [s[0] for s in self.RANGE_STEPS] + ["FINAL"]
+        text = {
+            "NEUTRAL": "open hand, palm to cameras, hold still 2 s",
+            "FORWARD": "move hand ~15 cm in the ARM's forward (+X) direction, hold",
+            "UP": "from there, move hand ~15 cm straight UP, hold",
+            "RETURN": "bring hand back to the start position",
+            "ROLL": "flat hand, slowly ROLL it CLOCKWISE a quarter turn (90 deg, like a doorknob), then back",
+            "TILT_A": "slowly TILT the hand (fingertips toward or away from the cameras) as far as it tracks, then back",
+            "TILT_B": "now TILT the other way as far as it tracks, then back",
+            "FINAL": "hand back at the start, palm to cameras",
+        }
+        head = "calibrated" if self.step == "DONE" else \
+            f"CALIB {steps.index(self.step) + 1}/{len(steps)}: {text[self.step]}"
+        return head + (f"  [{self.msg}]" if self.msg else "")
 
     def _hand_rpy(self, pose):
         """Hand rotation from neutral in robot axes (deg), as tracking measures it."""
@@ -176,15 +187,33 @@ class HandCalibrator:
             if np.linalg.norm(d) < self.FWD_MIN_M:
                 self.buf.clear()
             elif self._still(t, self.FWD_HOLD_S):
-                fwd = np.median([b[1]["p"] for b in self.buf], axis=0) - self.neutral_p
+                self.fwd_p = np.median([b[1]["p"] for b in self.buf], axis=0)
+                fwd = self.fwd_p - self.neutral_p
                 try:
                     self.A = h3.robot_axes(fwd)
                 except ValueError:
                     self.msg = "that was vertical; move horizontally"
                     self.buf.clear()
                     return False
+                self.fwd = fwd
                 tilt = np.degrees(np.arcsin(abs(fwd @ [0, -1, 0]) / np.linalg.norm(fwd)))
                 self.msg = f"forward = cam {np.round(fwd / np.linalg.norm(fwd), 2)}, {tilt:.0f} deg off level"
+                self.step, self.buf = ("UP" if self.up_step else "RETURN"), deque()
+        elif self.step == "UP":
+            d = pose["p"] - self.fwd_p
+            if np.linalg.norm(d) < self.FWD_MIN_M:
+                self.buf.clear()
+            elif self._still(t, self.FWD_HOLD_S):
+                up = np.median([b[1]["p"] for b in self.buf], axis=0) - self.fwd_p
+                up = up / np.linalg.norm(up)
+                ang = np.degrees(np.arccos(abs(up @ self.fwd) / np.linalg.norm(self.fwd)))
+                if ang < self.UP_MIN_ANGLE:
+                    self.msg = f"that was only {ang:.0f} deg from forward; move straight up"
+                    self.buf.clear()
+                    return False
+                self.A = h3.robot_axes(self.fwd, up_cam=up)
+                tilt = np.degrees(np.arccos(np.clip(up @ [0, -1, 0], -1, 1)))
+                self.msg = f"up = cam {np.round(up, 2)}: cameras {tilt:.0f} deg off level"
                 self.step, self.buf = "RETURN", deque()
         elif self.step == "RETURN" and np.linalg.norm(pose["p"] - self.neutral_p) < self.RETURN_M:
             if self.range_steps:
@@ -262,6 +291,25 @@ def _selftest():
     r, p = cal.result["range_roll"], cal.result["range_pitch"]
     assert np.isnan(r[1]) and 30 < r[0] < 37 and np.isnan(p[0]) and abs(p[1] - 45) < 3, (r, p)
     print(f"hand_calib self-test OK (roll clockwise = -{r[0]:.0f}, tilt down {p[1]:.0f} deg)")
+
+    # up step: cameras pitched 20 deg (image-up isn't robot up); the measured up fixes the axes
+    tilt = math.radians(20)
+    Rc = np.array([[1, 0, 0], [0, math.cos(tilt), -math.sin(tilt)], [0, math.sin(tilt), math.cos(tilt)]])
+    true_A = h3.robot_axes([0, 0, 1]) @ Rc.T  # rows = robot X, Y, Z in the tilted cam's coords
+    fwd_c, up_c = true_A[0], true_A[2]
+    for up_step, want_err in ((False, 15.0), (True, 2.0)):
+        cal, t[0] = HandCalibrator("fit", range_steps=False, up_step=up_step), 0.0
+        run(2.5, lambda s: pose())
+        run(1.5, lambda s: pose(base + fwd_c * 0.12 * min(1, 2 * s)))
+        if up_step:
+            assert cal.step == "UP", cal.step
+            run(1.5, lambda s: pose(base + fwd_c * 0.12 + up_c * 0.12 * min(1, 2 * s)))
+        run(1.5, lambda s: pose(base + fwd_c * 0.12 * (1 - min(1, 2 * s))))
+        assert cal.step == "DONE", (up_step, cal.step)
+        err = math.degrees(math.acos(np.clip(cal.result["A"][2] @ up_c, -1, 1)))
+        assert (err < want_err) if up_step else (err > want_err), (up_step, err)
+        print(f"  cameras 20 deg off level, up step {'on ' if up_step else 'off'}: robot up off by {err:.1f} deg"
+              + (f"  [{cal.msg}]" if up_step else ""))
 
 
 if __name__ == "__main__":

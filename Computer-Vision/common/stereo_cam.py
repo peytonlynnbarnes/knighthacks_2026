@@ -48,7 +48,8 @@ DEFAULT_CAMS = [1, 2]  # the built-in camera is usually 0; check with --list
 def make_landmarks(backend="wilor", **kw):
     """The landmark backend: StereoLandmarks(f0, f1, t) -> (px0, px1), (21, 2) pixels
     per view or None. wilor = ../WiLoR/wilor_landmarks.py (MANO model on the Apple GPU,
-    MPS; kw: hand, yolo_every, fp32)."""
+    MPS; kw: hand, yolo_every, fp32, warmup_size = the capture size: MPS compiles
+    kernels per input shape, so a mismatch stalls ~0.3 s when the hand first appears)."""
     if backend not in BACKENDS:
         raise ValueError(f"backend {backend!r}: one of {BACKENDS}")
     d = os.path.join(CV_DIR, "WiLoR")
@@ -296,7 +297,7 @@ def main():
         return
     cam = StereoCam(args.cams, size=args.size)
     print("cameras:", cam.configure())
-    lms = None if args.no_landmarks else make_landmarks(args.backend)
+    lms = None if args.no_landmarks else make_landmarks(args.backend, warmup_size=tuple(args.size))
     n, t_fps, fps = 0, time.monotonic(), 0.0
     try:
         while True:
