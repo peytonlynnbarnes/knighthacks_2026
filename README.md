@@ -1,5 +1,6 @@
 # kh: hand-tracked SO-ARM101
 
+xD
 Computer vision tracks a hand, and the SO-ARM101 robot arm follows it.
 
 - `control/`: talks to the arm's Feetech STS3215 servos (Python venv).
