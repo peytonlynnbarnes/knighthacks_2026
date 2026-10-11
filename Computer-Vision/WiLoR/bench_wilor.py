@@ -43,28 +43,13 @@ def main():
     ap.add_argument("--compile", action="store_true", help="torch.compile the model first")
     args = ap.parse_args()
 
-    import ultralytics.nn.tasks
-    from ultralytics import YOLO
-    from wilor.models import load_wilor
+    from wilor_landmarks import CROP, load_models
 
-    dev = torch.device("mps" if torch.backends.mps.is_available() else
-                       "cuda" if torch.cuda.is_available() else "cpu")
-    dtype = torch.float32 if (args.fp32 or dev.type == "cpu") else torch.float16
-    if dev.type == "cuda":
-        torch.backends.cudnn.benchmark = True
-    torch.serialization.add_safe_globals([ultralytics.nn.tasks.PoseModel])
-    cwd = os.getcwd()
-    os.chdir(REPO)  # load_wilor hardcodes ./mano_data/
-    try:
-        model, cfg = load_wilor(checkpoint_path="./pretrained_models/wilor_final.ckpt",
-                                cfg_path="./pretrained_models/model_config.yaml")
-        detector = YOLO("./pretrained_models/detector.pt").to(dev)
-    finally:
-        os.chdir(cwd)
-    model = model.to(device=dev, dtype=dtype).eval()
+    # same loader as the node (device choice, dtype, MPS contiguity fix)
+    model, detector, dev, dtype = load_models(fp32=args.fp32)
     if args.compile:
         model = torch.compile(model)
-    size = cfg.MODEL.IMAGE_SIZE
+    size = CROP
     name = {"cuda": lambda: torch.cuda.get_device_name(), "mps": lambda: "Apple GPU"}.get(dev.type, lambda: "cpu")()
     print(f"device {dev} ({name}), {dtype}, image size {size}")
 
