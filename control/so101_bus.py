@@ -72,18 +72,21 @@ JOINT_CAL = {
 # on hardware (2026-10-09) to match the URDF zero L-pose.
 HOME = {name: CENTER for name in JOINT_CAL}
 
-# Soft limits (ticks) from the hand-measured range of motion
-# (calib/ranges_session1.json), applied on top of the EEPROM limits.
+# Soft limits (ticks): the usable range = the hand-measured range of motion
+# (calib/ranges_session1.json) intersected with the EEPROM limits read from the
+# servos (2026-10-09), so the IK (which can't read the bus) plans exactly what
+# feetech_mirror allows. Measured, where EEPROM is narrower: shoulder_lift 815,
+# elbow_flex 3176, wrist_flex 694, gripper 3523.
 # wrist_roll's travel crosses the 0/4095 seam (2878 -> 4095/0 -> 2645), and
 # position mode can't pass the seam, so it's kept on the side containing
 # home (2048): 0..2645.
 SOFT_LIMITS = {
     "shoulder_pan": (1272, 3000),
-    "shoulder_lift": (815, 3199),
-    "elbow_flex": (944, 3176),
-    "wrist_flex": (694, 3071),
+    "shoulder_lift": (1067, 3199),
+    "elbow_flex": (944, 2879),
+    "wrist_flex": (833, 3071),
     "wrist_roll": (0, 2645),
-    "gripper": (2007, 3523),
+    "gripper": (2007, 3298),
 }
 
 # Gripper command range (ticks), for feetech_mirror --gripper. Closed jaws read
