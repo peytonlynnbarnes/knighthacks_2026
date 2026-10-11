@@ -34,6 +34,7 @@ The axes depend on how the cameras are mounted, so redo it if they move.
 import json
 import math
 import os
+import time
 from collections import deque
 
 import numpy as np
@@ -45,10 +46,17 @@ from stereo_cam import HERE
 HAND_PATH = os.path.join(HERE, "calib", "hand_wilor.json")
 
 
-def hand_path(backend="wilor"):
-    """Where the hand calibration is saved (a record, not reloaded). Per landmark
-    backend, so each keeps its own record: calib/hand_<backend>.json."""
-    return os.path.join(HERE, "calib", f"hand_{backend}.json")
+def hand_path(backend="wilor", hand="right"):
+    """Where a hand calibration is saved: calib/hand_<backend>.json (the position hand) and
+    calib/hand_<backend>_left.json (the two-hand mode's left hand). hand_target_node reuses
+    them at startup when they were made with the same camera rig (--calibrate: new ones)."""
+    return os.path.join(HERE, "calib", f"hand_{backend}{'' if hand == 'right' else '_' + hand}.json")
+
+
+def rig_signature(rig):
+    """The stereo rig's extrinsics (R, t), rounded: a hand calibration (camera-frame axes,
+    neutral pose) only holds for the rig it was made with. Capture-size scaling keeps R, t."""
+    return [round(float(v), 4) for v in np.r_[np.ravel(rig["R"]), np.ravel(rig["t"])]]
 
 
 class HandCalibrator:
@@ -319,15 +327,37 @@ class LeftHandCalibrator:
         return False
 
 
-def save_hand(res, path=HAND_PATH):
+def save_hand(res, path=HAND_PATH, rig=None):
+    """Save a calibration result (+ the rig's signature and the time, for reuse)."""
     os.makedirs(os.path.dirname(path), exist_ok=True)
+    out = {k: (v if v is None or isinstance(v, str) else np.asarray(v).tolist()) for k, v in res.items()}
+    if rig is not None:
+        out["rig_signature"] = rig_signature(rig)
+    out["saved_at"] = time.strftime("%Y-%m-%d %H:%M")
     with open(path, "w") as f:
-        json.dump({k: np.asarray(v).tolist() for k, v in res.items()}, f, indent=1)
+        json.dump(out, f, indent=1)
 
 
-def load_hand(path=HAND_PATH):
-    with open(path) as f:
-        return {k: np.array(v) for k, v in json.load(f).items()}
+def load_hand(path=HAND_PATH, rig=None):
+    """A saved calibration result like the calibrator's (arrays; scalars and strings as
+    is), or None if missing, unreadable, or (rig given) made with another rig."""
+    try:
+        with open(path) as f:
+            d = json.load(f)
+    except (OSError, ValueError):
+        return None
+    if rig is not None:
+        sig = d.get("rig_signature")
+        if sig is None or not np.allclose(sig, rig_signature(rig), atol=1e-3):
+            return None
+    out = {}
+    for k, v in d.items():
+        if v is None or isinstance(v, str) or k in ("rig_signature", "saved_at"):
+            out[k] = v
+        else:
+            a = np.array(v, dtype=float)
+            out[k] = a.item() if a.ndim == 0 else a
+    return out
 
 
 def _selftest():

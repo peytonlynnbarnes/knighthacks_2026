@@ -201,11 +201,17 @@ class IKNode(Node):
         if self.target is None:
             return
         age = (self.get_clock().now() - self.target_t).nanoseconds * 1e-9
+        roll = self.roll_lock()
         if age > self.get_parameter("stale_s").value:
-            self.get_logger().warn(f"target stale ({age:.1f} s), holding", throttle_duration_sec=5.0)
-            return
-        target = self.interp.sample(self.get_clock().now().nanoseconds * 1e-9)
-        q = self.solver.solve(target, roll_lock=self.roll_lock())
+            if roll is None:
+                self.get_logger().warn(f"target stale ({age:.1f} s), holding", throttle_duration_sec=5.0)
+                return
+            # position hand hidden (clutch) but the roll hand still there: hold the last
+            # target and keep following the roll (before, the wrist only turned with both hands)
+            target = self.target
+        else:
+            target = self.interp.sample(self.get_clock().now().nanoseconds * 1e-9)
+        q = self.solver.solve(target, roll_lock=roll)
         info = self.solver.info
         if q is None:
             p = self.home_p + target[:3]

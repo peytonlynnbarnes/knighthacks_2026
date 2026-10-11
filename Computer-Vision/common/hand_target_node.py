@@ -96,8 +96,9 @@ import numpy as np
 import hand3d as h3
 import macos_app
 from frames import FrameRecorder, FrameReplay, ReplayEnd
-from hand_calib import HandCalibrator, LeftHandCalibrator, hand_path, save_hand
-from hand_mapping import (BOX_MIN, IMM_PRESETS, KALMAN_DEFAULTS, GripFilter, HandMapper, RollFilter, RotationShaper,
+from hand_calib import HandCalibrator, LeftHandCalibrator, hand_path, load_hand, save_hand
+from hand_mapping import (BOX_MAX, BOX_MIN, IMM_PRESETS, KALMAN_DEFAULTS, CylinderMap, GripFilter, HandMapper,
+                          RollFilter, RotationShaper,
                           StereoIMM, StereoKalman, StillHold, facing_weight, gains_from_range)
 from stereo_cam import (BACKENDS, CAM_FPS, CAPTURE_SIZE, DEFAULT_CAMS, RIG_PATH, StereoCam, draw_hand, load_rig,
                         make_landmarks, scale_rig)
@@ -116,6 +117,20 @@ ROLL_GAIN = (1.5, 1.5)         # (neg, pos) when the range calibration didn't me
 PITCH_GAIN = (1.0, 2.0)        # (up, down) likewise
 GRIP_OPEN_CURL = 1.35          # fully-open curl when the hand calibration has none
 GRIP_OPEN_MARGIN = 0.9         # calibrated flat-hand curl x this = fully open
+
+
+def wrist_roll_limits(margin_deg=3.0):
+    """wrist_roll's usable range (rad) as the IK has it (so101_bus SOFT_LIMITS + JOINT_CAL,
+    read by so101_mirror.model; ~-285..+51 deg since the 2026-10-11 Homing_Offset shift),
+    minus a margin; RollFilter's old defaults if that isn't available."""
+    try:
+        from so101_mirror.model import hardware_limits
+        lo, hi = hardware_limits()["wrist_roll"]
+        m = math.radians(margin_deg)
+        return lo + m, hi - m
+    except Exception as e:  # no ROS workspace sourced, or the file missing
+        print(f"wrist_roll limits: {e}; using {RollFilter().lo:.2f}..{RollFilter().hi:.2f} rad", flush=True)
+        return RollFilter().lo, RollFilter().hi
 
 
 class Publisher:
@@ -373,8 +388,9 @@ def main():
     ap.add_argument("--rot-scale", type=float, default=1.0,
                     help="multiplies all the rotation gains below")
     ap.add_argument("--left-roll-gain", type=float, default=None,
-                    help="two hands: wrist_roll turn per left-hand turn (default: from the calibration's "
-                         f"quarter turn, 90 / measured, 1..{LEFT_ROLL_GAIN_MAX})")
+                    help="two hands: correction of the measured left-hand twist (default: from the "
+                         f"calibration's quarter turn, 90 / measured, 1..{LEFT_ROLL_GAIN_MAX}); after it, "
+                         "the hand's -90..+90 deg spans wrist_roll's whole range")
     ap.add_argument("--roll-gain", type=float, nargs=2, default=None, metavar=("NEG", "POS"),
                     help="gripper roll per hand roll (about the forward axis), each direction; "
                          "gripper roll is 0..+90, so negative gains make -hand roll the "
@@ -398,6 +414,16 @@ def main():
     ap.add_argument("--z-min", type=float, default=float(BOX_MIN[2]),
                     help="lowest arm offset below home (m); the table guard. Lower it in "
                          "small steps (home is 17.6 cm above base_link)")
+    ap.add_argument("--pan-mapping", choices=("cylinder", "cartesian"), default="cylinder",
+                    help="cylinder (default): hand left/right turns the base (angle), forward/back is "
+                         "reach; cartesian: plain x/y (the pan reached only ~+-30 deg)")
+    ap.add_argument("--pan-span", type=float, default=0.20,
+                    help="cylinder: hand travel to either side (m) that gives --pan-deg")
+    ap.add_argument("--pan-deg", type=float, default=75.0,
+                    help="cylinder: base rotation at --pan-span (deg; clipped to the arm's pan range)")
+    ap.add_argument("--calibrate", action="store_true",
+                    help="run the hand calibration even if a saved one fits this camera rig "
+                         "(default: reuse calib/hand_<backend>[_left].json; 'c' recalibrates any time)")
     ap.add_argument("--max-lin", type=float, default=1.0, help="target speed limit (m/s); 0.25 = old, smoother but ~200 ms more lag")
     ap.add_argument("--max-ang", type=float, default=360.0,
                     help="target rotation speed limit (deg/s, gripper; gains make it turn faster "
@@ -556,13 +582,15 @@ def main():
                                   q=kf["q"] if args.kf_q is None else args.kf_q, gate=args.kf_gate,
                                   v_tau=args.kf_vtau, err_ref=3.0 * px_s)
         still = None if args.still_hold is None else StillHold(args.still_hold, 3 * args.still_hold)
+        side = args.pan_span if cyl is not None else -BOX_MIN[1]  # sideways half-range of the hand box
         mapper = HandMapper(res["A"], res["neutral_p"], res["neutral_R"], scale=args.scale,
                             rot_filter=tuple(args.rot_filter),
                             shaper=RotationShaper(gains["roll"], gains["pitch"], args.yaw_gain,
                                                   math.radians(args.rot_deadband), scale=args.rot_scale),
                             neutral_offset=args.neutral_offset,
                             max_lin_speed=args.max_lin, max_ang_speed=math.radians(args.max_ang),
-                            box_min=np.array([BOX_MIN[0], BOX_MIN[1], args.z_min]),
+                            box_min=np.array([BOX_MIN[0], -side, args.z_min]),
+                            box_max=np.array([BOX_MAX[0], side, BOX_MAX[2]]),
                             pos_filter=tuple(args.euro_pos),
                             kalman=kalman, still_hold=still, lead_s=args.lead)
         if old is not None:  # recalibration: continue (speed-limited) from the current target
@@ -571,6 +599,7 @@ def main():
     calib = HandCalibrator(args.frame, not args.no_range_calib, args.calib_up, not args.two_hands)  # every run: calibration hand = origin
 
     pub = Publisher(not args.no_ros)
+    cyl = CylinderMap(args.pan_span, args.pan_deg) if args.pan_mapping == "cylinder" else None
     replay = Replay(args.replay, realtime=not args.no_ros) if args.replay else None
     if replay is not None:  # the landmarks are in the file; it says which backend made them
         if replay.backend not in BACKENDS:
@@ -620,10 +649,17 @@ def main():
         # gain: the calibration asked for a quarter turn and measured roll_deg of twist about
         # the robot's forward axis; a hand turning about a tilted axis shows only part of it
         # (90 deg read as ~45 on 2026-10-11), so the wrist turned half as far as the hand
-        gain = args.left_roll_gain or min(LEFT_ROLL_GAIN_MAX, max(1.0, 90.0 / max(res["roll_deg"], 1.0)))
-        print(f"left roll: calibration quarter turn measured {res['roll_deg']:.0f} deg -> gain {gain:.2f}"
-              + (" (--left-roll-gain)" if args.left_roll_gain else ""), flush=True)
-        roll_f = RollFilter(sign=-res["cw_sign"] * args.roll_sign, scale=gain, start=old_roll, axis=left_axis)
+        corr = args.left_roll_gain or min(LEFT_ROLL_GAIN_MAX, max(1.0, 90.0 / max(res["roll_deg"], 1.0)))
+        # absolute: the hand's twist from its calibrated neutral, +-90 deg (after the
+        # correction), spans wrist_roll's whole range lo..hi; neutral = the middle
+        lo, hi = wrist_roll_limits()
+        scale = corr * (hi - lo) / 2 / math.radians(90)
+        print(f"left roll: calibration quarter turn measured {res['roll_deg']:.0f} deg -> x{corr:.2f}"
+              + (" (--left-roll-gain)" if args.left_roll_gain else "")
+              + f"; hand -90..+90 deg -> wrist_roll {math.degrees(lo):+.0f}..{math.degrees(hi):+.0f} deg "
+              f"(neutral {math.degrees((lo + hi) / 2):+.0f})", flush=True)
+        roll_f = RollFilter(sign=-res["cw_sign"] * args.roll_sign, scale=scale, lo=lo, hi=hi, start=old_roll,
+                            axis=left_axis, neutral=res["neutral_R"])
         old_grip = grip_l.grip if grip_l is not None else None
         grip_l = GripFilter(grip_open, args.grip_closed_curl, hold_deg=args.grip_hold_deg,
                             band=args.grip_band, tau=GRIP_TAU, max_dt=HandMapper.MAX_DT)
@@ -645,6 +681,9 @@ def main():
         if lcal is not None:
             if not lcal.feed(lpose, t):
                 return (l0, l1), lcal.instructions()
+            if not replaying:
+                save_hand(lcal.result, hand_path(args.backend, "left"), rig)
+                print(f"left hand calibrated; saved {hand_path(args.backend, 'left')} (reused next start)", flush=True)
             start_left(lcal.result)
             lcal = None
         if lpose is not None and lpose["mode"] == "stereo":
@@ -713,8 +752,8 @@ def main():
                 if replaying:  # don't overwrite the live calibration
                     print(f"hand calibrated ({calib.msg})")
                 else:
-                    save_hand(calib.result, hand_path(args.backend))
-                    print(f"hand calibrated ({calib.msg}); saved {hand_path(args.backend)}")
+                    save_hand(calib.result, hand_path(args.backend), rig)
+                    print(f"hand calibrated ({calib.msg}); saved {hand_path(args.backend)} (reused next start)")
                 start_tracking(calib.result)
                 calib = None
                 lost_since = None
@@ -730,6 +769,8 @@ def main():
             raw_p, raw_R = mapper.raw_target(pose["p"], pose["R"])
             target = mapper.update(pose["p"], pose["R"], t, pose.get("err"), pose["mode"] != "stereo")
             out = target.copy()
+            if cyl is not None:  # side motion -> the base's rotation (--pan-mapping)
+                out[:3] = cyl(out[:3])
             if args.no_orientation:
                 out[3:] = 0.0
             pub(out)
@@ -828,6 +869,27 @@ def main():
         with T("view.imshow"):
             cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", view)
             return cv2.waitKey(1) & 0xFF
+
+    # reuse the saved hand calibrations (made with this camera rig) instead of calibrating at
+    # every start; 'c' or --calibrate makes new ones (saved again). Replays use their own.
+    if not replaying and not args.calibrate:
+        saved = load_hand(hand_path(args.backend), rig)
+        if saved is not None and "A" in saved:
+            start_tracking(saved)
+            calib = None
+            print(f"hand: saved calibration from {saved.get('saved_at', '?')} ({hand_path(args.backend)}); "
+                  "press c to recalibrate", flush=True)
+            if two:
+                left = load_hand(hand_path(args.backend, "left"), rig)
+                if left is not None and "neutral_R" in left:
+                    start_left(left)
+                    lcal = None
+                    print(f"left hand: saved calibration from {left.get('saved_at', '?')}", flush=True)
+                else:
+                    print("left hand: no saved calibration for this camera rig: calibrate it now", flush=True)
+        else:
+            print("hand: no saved calibration for this camera rig: calibrating (saved for the next start)",
+                  flush=True)
 
     next_report = [time.monotonic() + 2.0]
 

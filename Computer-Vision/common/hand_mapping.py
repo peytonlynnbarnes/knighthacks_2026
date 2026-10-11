@@ -402,6 +402,34 @@ class GripFilter:
         return self.grip
 
 
+# Pan geometry (base_link, from the IK's URDF FK, 2026-10-11): the pan axis is 3.9 cm in
+# front of base_link's origin; the IK home tip (offset 0) is at x 0.2914; +pan swings the tip
+# toward -y, so the claw's direction angle is -pan. Pan soft limits -66..+82 deg, minus the
+# IK's 2 deg margin -> direction angle -80..+64 deg.
+PAN_AXIS_X = 0.0388
+HOME_TIP_X = 0.2914
+PAN_DIR_LIMITS_DEG = (-80.0, 64.0)
+
+
+class CylinderMap:
+    """Hand-space offset (m, from HandMapper: x forward, y left, z up) -> IK offset, with
+    the side motion as the base's rotation: y -> the direction angle (deg_at_span at
+    +-span, clipped to the pan range), x -> reach from the pan axis, z unchanged.
+    A box in plain x/y capped the pan at ~+-30 deg (+-15 cm at 19..33 cm reach). Pure."""
+
+    def __init__(self, span=0.20, deg_at_span=75.0, limits=PAN_DIR_LIMITS_DEG,
+                 axis_x=PAN_AXIS_X, home_x=HOME_TIP_X):
+        self.k = math.radians(deg_at_span) / span
+        self.lo, self.hi = (math.radians(v) for v in limits)
+        self.axis_x, self.home_x = axis_x, home_x
+
+    def __call__(self, off):
+        x, y, z = off
+        r = self.home_x - self.axis_x + x
+        th = min(self.hi, max(self.lo, self.k * y))
+        return np.array([self.axis_x + r * math.cos(th) - self.home_x, r * math.sin(th), z])
+
+
 class RollFilter:
     """Left-hand twist -> steady wrist_roll command (rad). Pure, no ROS. Two-hand mode
     (TWO_HAND_PLAN.md); ported from Second-Hand-Controls-Wrist (ba9e37a).
@@ -424,7 +452,11 @@ class RollFilter:
 
     def __init__(self, sign=1.0, scale=1.0, lo=-2.70, hi=0.85, max_speed=math.radians(90),
                  jump=math.radians(35), confirm=3, curl_rate=0.8, edge_deg=FACING_DEG[0],
-                 reanchor_s=0.3, filt=(1.5, 0.5), start=0.0, axis=None):
+                 reanchor_s=0.3, filt=(1.5, 0.5), start=0.0, axis=None, neutral=None, center=None):
+        """neutral: absolute mode. The twist is always measured from this hand rotation
+        (the calibration's neutral) and added to `center` (default: the middle of lo..hi);
+        no re-anchoring, so the same hand angle always gives the same roll, and gripping /
+        a hidden hand only hold it."""
         self.sign, self.scale, self.lo, self.hi = sign, scale, lo, hi
         self.axis = None if axis is None else np.asarray(axis, float) / np.linalg.norm(axis)
         # max_speed and jump are for the hand's turn: a gain > 1 scales them with it, so a
@@ -435,6 +467,10 @@ class RollFilter:
         self.f = OneEuro(*filt)
         self.cmd = self.raw = self.base = float(start)
         self.anchor = self.lost_since = self.t = self.curl = self.pending = None
+        self.absolute = neutral is not None
+        if self.absolute:
+            self.anchor = np.asarray(neutral, float)
+            self.base = self.raw = 0.5 * (lo + hi) if center is None else float(center)
         self.curl_v, self.n = 0.0, 0
 
     def lost(self, t):
@@ -454,7 +490,9 @@ class RollFilter:
         hidden = self.lost_since is not None and t - self.lost_since >= self.reanchor_s
         self.lost_since = None
         gripping = self.curl_v > self.curl_rate
-        if self.anchor is None or hidden or gripping:
+        if self.absolute and gripping:
+            state = "grip"  # fingers moving: hold (the twist reads wrong while they move)
+        elif not self.absolute and (self.anchor is None or hidden or gripping):
             self.anchor, self.base, self.pending = R, self.raw, None
             state = "grip" if gripping else "anchor"
         elif palm_deg > self.edge_deg:
@@ -780,6 +818,18 @@ def _selftest():
         t3 += 0.1
         out, _ = rf3.update(rpy(math.radians(min(90, 5 * k)), 0, 0), 1.0, 0.0, t3)
     assert out <= 0.85 + 1e-9, math.degrees(out)
+    # cylinder map: home stays home; +-span -> +-75 deg about the pan axis (clipped to the
+    # pan range); near the middle 1 cm of hand ~ r * k cm of tip; reach and height pass
+    cm = CylinderMap(span=0.20, deg_at_span=75.0)
+    assert np.allclose(cm(np.zeros(3)), 0)
+    r0 = HOME_TIP_X - PAN_AXIS_X
+    for y, want in ((0.20, 64.0), (-0.20, -75.0), (0.10, 37.5), (-0.30, -80.0)):
+        p = cm(np.array([0.0, y, 0.0])) + [HOME_TIP_X, 0, 0]
+        ang = math.degrees(math.atan2(p[1], p[0] - PAN_AXIS_X))
+        assert abs(ang - want) < 1e-6 and abs(math.hypot(p[0] - PAN_AXIS_X, p[1]) - r0) < 1e-9, (y, ang)
+    d = cm(np.array([0.0, 0.001, 0.0]))[1] / 0.001
+    assert abs(d - r0 * math.radians(75) / 0.20) < 0.01, d
+    assert np.allclose(cm(np.array([0.05, 0.0, -0.03])), [0.05, 0.0, -0.03])
     print("hand_mapping self-test OK")
 
 
