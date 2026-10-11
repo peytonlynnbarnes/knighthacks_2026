@@ -205,7 +205,8 @@ def capture_board(cam, args):
                 g = cv2.cvtColor(f, cv2.COLOR_BGR2GRAY)
                 ok, c = cv2.findChessboardCorners(g, BOARD, flags)
                 if ok:
-                    c = cv2.cornerSubPix(g, c, (5, 5), (-1, -1), crit)
+                    # (N, 1, 2) as in OpenCV 4; OpenCV 5 (conda's, pinned by RoboStack) returns (N, 2)
+                    c = cv2.cornerSubPix(g, c, (5, 5), (-1, -1), crit).reshape(-1, 1, 2)
                     cv2.drawChessboardCorners(f, BOARD, c, ok)
                 found.append(c if ok else None)
                 tilt.append(board_tilt(c, obj, Kg) if ok else None)
@@ -273,9 +274,11 @@ def solve_board(views, pairs, size, args):
     obj = board_points(args.square_mm)
     size = tuple(int(v) for v in size)
     crit = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 100, 1e-6)
-    # few free parameters: focal (one, square pixels), center, k1/k2 only
+    # few free parameters: focal (one, square pixels), center, k1/k2 (+ k3 with --free-k3)
     cflags = (cv2.CALIB_USE_INTRINSIC_GUESS | cv2.CALIB_FIX_ASPECT_RATIO |
-              cv2.CALIB_ZERO_TANGENT_DIST | cv2.CALIB_FIX_K3)
+              cv2.CALIB_ZERO_TANGENT_DIST)
+    if not args.free_k3:
+        cflags |= cv2.CALIB_FIX_K3
     if args.fix_center:
         cflags |= cv2.CALIB_FIX_PRINCIPAL_POINT
     problems, Ks, fovs = [], [], []
@@ -342,6 +345,8 @@ def main():
                     help="capture size; the node uses whatever the rig was calibrated at")
     ap.add_argument("--fix-center", action="store_true",
                     help="board mode: pin the principal point to the image center")
+    ap.add_argument("--free-k3", action="store_true",
+                    help="board mode: also solve k3 (wide lenses, e.g. Elgato Facecam MK.2 ~76 deg)")
     ap.add_argument("--hfov", type=float, default=None,
                     help="horizontal field of view guess (deg): hand mode intrinsics, board mode start")
     ap.add_argument("--seconds", type=float, default=25.0, help="hand mode: capture time")
