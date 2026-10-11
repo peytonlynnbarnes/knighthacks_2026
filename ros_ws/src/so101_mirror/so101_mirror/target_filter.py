@@ -7,7 +7,10 @@ on others, so the arm gets uneven steps. TargetInterpolator samples the target
 path `delay` seconds behind real time instead, linearly between the two
 targets around that moment, so every tick moves a fair share. The delay should
 cover one normal gap between targets (~40 ms at 25 fps); a later target just
-holds the last one until it arrives (no extrapolation).
+holds the last one until it arrives (no extrapolation), so the arm steps.
+With auto_max > 0 the delay follows the target rate: AUTO_FACTOR x the median
+of the recent gaps, at least `delay`, at most `auto_max` (WiLoR on the Mac:
+~90 ms gaps -> ~80 ms delay; simulated: 1.5x smoother commands for +28 ms lag).
 
 Optional time-based smoothing (tau, s): an EMA whose strength depends on
 elapsed time, not on how many targets arrived (the old per-message alpha
@@ -28,14 +31,25 @@ def _wrap(a):
 class TargetInterpolator:
     """[x y z roll pitch yaw] targets in, evenly paced samples out (angles wrap)."""
 
-    def __init__(self, delay=0.04, tau=0.0, max_dt=0.1, keep=16):
-        self.delay, self.tau, self.max_dt = delay, tau, max_dt
+    AUTO_FACTOR = 0.9  # x median gap: ~as smooth as a full gap, a bit less lag
+    AUTO_GAPS = 8      # recent gaps the median is taken over
+
+    def __init__(self, delay=0.04, tau=0.0, max_dt=0.1, keep=16, auto_max=0.0):
+        self.delay, self.tau, self.max_dt, self.auto_max = delay, tau, max_dt, auto_max
         self.buf = deque(maxlen=keep)  # (t, target)
         self.out = self.out_t = None
 
     def reset(self):
         self.buf.clear()
         self.out = self.out_t = None
+
+    def current_delay(self):
+        """The delay in use: fixed, or (auto_max > 0) following the recent target gaps."""
+        if self.auto_max <= 0 or len(self.buf) < 3:
+            return self.delay
+        ts = [b[0] for b in list(self.buf)[-(self.AUTO_GAPS + 1):]]
+        gap = float(np.median(np.diff(ts)))
+        return min(max(self.delay, self.AUTO_FACTOR * gap), self.auto_max)
 
     def add(self, t, d):
         d = np.asarray(d, dtype=float)
@@ -62,7 +76,7 @@ class TargetInterpolator:
         """Target for time t (sampled at t - delay, then smoothed), or None before any target."""
         if not self.buf:
             return None
-        x = self._at(t - self.delay)
+        x = self._at(t - self.current_delay())
         if self.tau > 0 and self.out is not None:
             dt = min(max(0.0, t - self.out_t), self.max_dt)
             diff = x - self.out
@@ -121,6 +135,12 @@ def _selftest():
         ends.append(out[0])
     print(f"tau 0.1 s after 0.2 s at 25/50/100 Hz: {np.round(ends, 4)}")
     assert np.ptp(ends) < 0.01 and abs(ends[0] - (1 - math.exp(-2))) < 0.01
+    # auto delay: follows the target gaps, clipped to [delay, auto_max]
+    for gap, want in ((0.033, 0.04), (0.09, 0.081), (0.3, 0.12)):
+        ti = TargetInterpolator(delay=0.04, auto_max=0.12)
+        for k in range(10):
+            ti.add(k * gap, np.zeros(6))
+        assert abs(ti.current_delay() - want) < 1e-9, (gap, ti.current_delay())
     print("target_filter self-test OK")
 
 

@@ -52,7 +52,10 @@ Parameters:
     hw_limits_file   so101_bus.py to read SOFT_LIMITS from ('' = URDF only)
     interp_delay     sample the target path this far behind real time (s),
                      linearly between the targets around that moment; ~one
-                     normal gap between targets. 0 = latest target, as is
+                     normal gap between targets. 0 = latest target, as is.
+                     With interp_auto_max > 0 this is the minimum
+    interp_auto_max  > 0: the delay follows the target rate (0.9 x the median
+                     recent gap, at most this, s); 0 = fixed interp_delay
     smooth_tau       extra time-based smoothing of the target (s), 0 = off
                      (smoothing belongs in the CV node; this replaced the
                      per-message EMA `alpha`, which smoothed more at higher fps)
@@ -89,6 +92,7 @@ class IKNode(Node):
         self.declare_parameter("solve_budget_s", 0.02)
         self.declare_parameter("hw_limits_file", HW_LIMITS_FILE)
         self.declare_parameter("interp_delay", 0.04)
+        self.declare_parameter("interp_auto_max", 0.12)
         self.declare_parameter("smooth_tau", 0.0)
         self.declare_parameter("max_pos_err", 0.01)
         self.declare_parameter("rate", 30.0)
@@ -115,7 +119,8 @@ class IKNode(Node):
         self.ws_min = np.array(gp("workspace_min"))
         self.ws_max = np.array(gp("workspace_max"))
 
-        self.interp = TargetInterpolator(delay=gp("interp_delay"), tau=gp("smooth_tau"))
+        self.interp = TargetInterpolator(delay=gp("interp_delay"), tau=gp("smooth_tau"),
+                                         auto_max=gp("interp_auto_max"))
         self.target = None                   # latest accepted offset [x y z r p y]
         self.target_t = None
         self.pubs = {j: self.create_publisher(Float64, ARM_TOPIC_PREFIX + j, 10)
