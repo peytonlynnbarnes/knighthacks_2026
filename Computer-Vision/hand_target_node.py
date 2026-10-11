@@ -92,7 +92,69 @@ def draw_axes(img, pose, K, d, scale=0.05):
         cv2.line(img, px[0], px[k], c, 3)
 
 
-def main():
+class HandTarget:
+    """Per-frame logic: hand calibration, then pose -> /ball_position + /gripper.
+
+    Shared by main() and the app window (ui/pipeline.py). args are the
+    parsed build_parser() options.
+    """
+
+    def __init__(self, est, pub, args):
+        self.est, self.pub, self.args = est, pub, args
+        self.calib = self.mapper = self.target = None
+        self.lost_since, self.grip = None, None  # when the hand disappeared; filtered grip 0..1
+
+    def recalibrate(self):
+        """(Re)start the hand calibration; nothing is published until it's done."""
+        self.calib, self.target = HandCalibrator(), None
+
+    def start_tracking(self, res):
+        a = self.args
+        self.est.set_hand(res["bones"], res["template"])
+        old = self.mapper
+        self.mapper = HandMapper(res["A"], res["neutral_p"], res["neutral_R"], scale=a.scale,
+                                 rot_scale=a.rot_scale, neutral_offset=a.neutral_offset,
+                                 max_lin_speed=a.max_lin, max_ang_speed=math.radians(a.max_ang))
+        if old is not None:  # recalibration: continue (speed-limited) from the current target
+            self.mapper.cur_p, self.mapper.cur_R, self.mapper.cur_t = old.cur_p, old.cur_R, old.cur_t
+
+    def step(self, pose, why, t):
+        """One frame's estimate -> (status line, whether a target was published)."""
+        a = self.args
+        if self.calib is not None:
+            if not self.calib.feed(pose, t):
+                return self.calib.instructions(), False
+            save_hand(self.calib.result)
+            print(f"hand calibrated ({self.calib.msg}); saved {HAND_PATH}")
+            self.start_tracking(self.calib.result)
+            self.calib, self.lost_since = None, None
+            return "", False
+        if self.mapper is None:
+            return "not calibrated", False
+        if pose is None:
+            if self.lost_since is None:
+                self.lost_since = t
+            return f"no hand (clutch: holding): {why}", False
+
+        if self.lost_since is not None and t - self.lost_since >= a.reanchor_s:
+            self.mapper.reanchor(pose["p"], pose["R"])  # clutch release: no jump
+        self.lost_since = None
+        self.target = self.mapper.update(pose["p"], pose["R"], t)
+        out = self.target.copy()
+        if a.no_orientation:
+            out[3:] = 0.0
+        self.pub(out)
+        status = f"TRACKING [{pose['mode']}]"
+        if pose["curl"] is not None:  # stereo only; mono -> gripper holds
+            g = (a.grip_open_curl - pose["curl"]) / (a.grip_open_curl - a.grip_closed_curl)
+            g = min(1.0, max(0.0, g))
+            self.grip = g if self.grip is None else self.grip + GRIP_ALPHA * (g - self.grip)
+            self.pub.grip(self.grip)
+            status += f" grip {self.grip:.2f} (curl {pose['curl']:.2f})"
+        return status, True
+
+
+def build_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cams", type=int, nargs=2, default=[0, 2])
     ap.add_argument("--rig", default=RIG_PATH)
@@ -115,7 +177,11 @@ def main():
                     help="finger curl that counts as fully closed (fist)")
     ap.add_argument("--reanchor-s", type=float, default=0.3,
                     help="hand hidden at least this long (s) -> re-anchor when it returns")
-    args = ap.parse_args()
+    return ap
+
+
+def main():
+    args = build_parser().parse_args()
 
     try:
         rig = load_rig(args.rig)
@@ -127,30 +193,18 @@ def main():
     est = h3.StereoHand(rig, reproj_px=args.reproj_px, mono_fallback=args.mono_fallback)
     print(f"stereo rig: {args.rig} ({rig['method']}), baseline "
           f"{np.linalg.norm(rig['t']) * 100:.1f} cm")
-    calib, mapper = None, None
-
-    def start_tracking(res):
-        nonlocal mapper
-        est.set_hand(res["bones"], res["template"])
-        old = mapper
-        mapper = HandMapper(res["A"], res["neutral_p"], res["neutral_R"], scale=args.scale,
-                            rot_scale=args.rot_scale, neutral_offset=args.neutral_offset,
-                            max_lin_speed=args.max_lin, max_ang_speed=math.radians(args.max_ang))
-        if old is not None:  # recalibration: continue (speed-limited) from the current target
-            mapper.cur_p, mapper.cur_R, mapper.cur_t = old.cur_p, old.cur_R, old.cur_t
-
-    if args.reuse_calib:
-        start_tracking(load_hand())
-        print(f"hand calibration loaded from {HAND_PATH}")
-    else:
-        calib = HandCalibrator()
 
     pub = Publisher(not args.no_ros)
+    ht = HandTarget(est, pub, args)
+    if args.reuse_calib:
+        ht.start_tracking(load_hand())
+        print(f"hand calibration loaded from {HAND_PATH}")
+    else:
+        ht.recalibrate()
+
     cam = StereoCam(args.cams)
     lms = StereoLandmarks()
-    lost_since, grip = None, None  # when the hand disappeared; filtered grip 0..1
     last_print, fps_n, fps_t, fps = 0.0, 0, time.monotonic(), 0.0
-    target, why = None, ""
     try:
         while True:
             pr = cam.pair()
@@ -159,44 +213,13 @@ def main():
             f0, f1, t = pr
             px0, px1 = lms(f0, f1, t)
             pose, why = est.estimate(px0, px1)
-            status = ""
-            published = False
-
-            if calib is not None:
-                if calib.feed(pose, t):
-                    save_hand(calib.result)
-                    print(f"hand calibrated ({calib.msg}); saved {HAND_PATH}")
-                    start_tracking(calib.result)
-                    calib = None
-                    lost_since = None
-                else:
-                    status = calib.instructions()
-            elif pose is not None:
-                if lost_since is not None and t - lost_since >= args.reanchor_s:
-                    mapper.reanchor(pose["p"], pose["R"])  # clutch release: no jump
-                lost_since = None
-                target = mapper.update(pose["p"], pose["R"], t)
-                out = target.copy()
-                if args.no_orientation:
-                    out[3:] = 0.0
-                pub(out)
-                published = True
-                status = f"TRACKING [{pose['mode']}]"
-                if pose["curl"] is not None:  # stereo only; mono -> gripper holds
-                    g = (args.grip_open_curl - pose["curl"]) / (args.grip_open_curl - args.grip_closed_curl)
-                    g = min(1.0, max(0.0, g))
-                    grip = g if grip is None else grip + GRIP_ALPHA * (g - grip)
-                    pub.grip(grip)
-                    status += f" grip {grip:.2f} (curl {pose['curl']:.2f})"
-            else:
-                if lost_since is None:
-                    lost_since = t
-                status = f"no hand (clutch: holding): {why}"
+            status, published = ht.step(pose, why, t)
+            target = ht.target
 
             if time.monotonic() - last_print > 0.5:
                 last_print = time.monotonic()
                 line = f"{'PUB ' if published and not args.no_ros else '    '}{status:<34} {fps:3.0f} fps"
-                if target is not None and calib is None:
+                if target is not None and ht.calib is None:
                     x, y, z, r, p, yw = target
                     line += (f"  xyz cm {x * 100:+6.1f} {y * 100:+6.1f} {z * 100:+6.1f}  "
                              f"rpy deg {math.degrees(r):+5.0f} {math.degrees(p):+5.0f} "
@@ -214,7 +237,7 @@ def main():
                 draw_axes(f0, pose, rig["K0"], rig["d0"])
             view = np.hstack([f0, f1])
             lines = [status, f"{fps:.0f} fps"]
-            if target is not None and calib is None:
+            if target is not None and ht.calib is None:
                 x, y, z, r, p, yw = target
                 lines.append(f"offset cm x{x * 100:+.1f} y{y * 100:+.1f} z{z * 100:+.1f}  "
                              f"rpy deg {math.degrees(r):+.0f} {math.degrees(p):+.0f} "
@@ -227,7 +250,7 @@ def main():
             if k in (ord("q"), 27):
                 break
             if k == ord("c"):
-                calib, target = HandCalibrator(), None  # stops publishing until done
+                ht.recalibrate()  # stops publishing until done
     except KeyboardInterrupt:
         pass
     finally:
