@@ -427,7 +427,10 @@ class RollFilter:
                  reanchor_s=0.3, filt=(1.5, 0.5), start=0.0, axis=None):
         self.sign, self.scale, self.lo, self.hi = sign, scale, lo, hi
         self.axis = None if axis is None else np.asarray(axis, float) / np.linalg.norm(axis)
-        self.max_speed, self.jump, self.confirm = max_speed, jump, confirm
+        # max_speed and jump are for the hand's turn: a gain > 1 scales them with it, so a
+        # quick turn isn't capped or taken for a glitch
+        g = max(1.0, abs(scale))
+        self.max_speed, self.jump, self.confirm = max_speed * g, jump * g, confirm
         self.curl_rate, self.edge_deg, self.reanchor_s = curl_rate, edge_deg, reanchor_s
         self.f = OneEuro(*filt)
         self.cmd = self.raw = self.base = float(start)

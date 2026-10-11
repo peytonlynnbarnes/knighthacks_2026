@@ -71,6 +71,12 @@ Filter testing (Phase 0, see filter_eval.py):
     --log out.npz     per frame: hand pose, unfiltered target, published
                        target, grip (live or replayed) -> filter_eval.py
 
+Threads (live cameras): camera readers (one per camera, stereo_cam) -> "gpu" thread
+(pair + WiLoR) -> "pose" thread (triangulate, calibration / mapping, publish) -> main
+thread (preview at camera rate, --cam-fps 60). The CPU YOLO re-check has its own thread
+(wilor_landmarks.AsyncDetector). --timing prints where the time goes every 2 s (stage
+names = thread.stage; the busiest thread is the bottleneck) and adds it to the preview.
+
 Safety: the target starts at home (all zeros, where feetech_mirror --live
 homes) and moves at most --max-lin m/s and --max-ang deg/s, then the IK
 (interpolation, workspace box) and feetech_mirror (rate limit, clamps) still apply.
@@ -78,6 +84,7 @@ homes) and moves at most --max-lin m/s and --max-ang deg/s, then the IK
 import argparse
 import json
 import math
+import queue
 import sys
 import threading
 import time
@@ -87,17 +94,23 @@ import cv2
 import numpy as np
 
 import hand3d as h3
+import macos_app
 from frames import FrameRecorder, FrameReplay, ReplayEnd
 from hand_calib import HandCalibrator, LeftHandCalibrator, hand_path, save_hand
 from hand_mapping import (BOX_MIN, IMM_PRESETS, KALMAN_DEFAULTS, GripFilter, HandMapper, RollFilter, RotationShaper,
                           StereoIMM, StereoKalman, StillHold, facing_weight, gains_from_range)
-from stereo_cam import (BACKENDS, DEFAULT_CAMS, RIG_PATH, StereoCam, draw_hand, fit_view, load_rig,
-                        make_landmarks)
+from stereo_cam import (BACKENDS, CAM_FPS, CAPTURE_SIZE, DEFAULT_CAMS, RIG_PATH, StereoCam, draw_hand, load_rig,
+                        make_landmarks, scale_rig)
+from timing import Timers
 
 BALL_TOPIC = "/ball_position"  # must match so101_mirror.BALL_TOPIC
 GRIP_TOPIC = "/gripper"        # std_msgs/Float64, 0 = open .. 1 = closed (feetech_mirror --gripper)
 WRIST_ROLL_TOPIC = "/wrist_roll_cmd"  # std_msgs/Float64 rad, two-hand mode; must match so101_mirror
+HW_STATUS_TOPIC = "/hw/status"  # std_msgs/String JSON from feetech_mirror; must match its STATUS_TOPIC
+ARM_STALE_S = 1.0              # s without a driver status = the driver stopped (or isn't running)
 LEFT_COLOR = (0, 140, 255)     # BGR orange: the left hand in the preview (two-hand mode)
+LEFT_ROLL_GAIN_MAX = 2.5       # auto left-roll gain cap (a short calibration turn would overshoot)
+PREVIEW_W = 800                # px, width of each view in the preview window
 GRIP_TAU = 0.04                # s, time constant of the grip smoothing (was 0.5 per frame ~ 25 fps)
 ROLL_GAIN = (1.5, 1.5)         # (neg, pos) when the range calibration didn't measure the roll
 PITCH_GAIN = (1.0, 2.0)        # (up, down) likewise
@@ -118,6 +131,68 @@ class Publisher:
         self.pub = self.node.create_publisher(Float64MultiArray, BALL_TOPIC, 10)
         self.grip_pub = self.node.create_publisher(Float64, GRIP_TOPIC, 10)
         self.roll_pub = self.node.create_publisher(Float64, WRIST_ROLL_TOPIC, 10)
+        # the driver's status (stalls, loop rate, servo protections), spun on its own thread
+        from rclpy.executors import SingleThreadedExecutor
+        from std_msgs.msg import String
+        self.hw, self.stalls_seen, self.last_stall, self.blocked_seen = None, 0, None, {}
+        self.node.create_subscription(String, HW_STATUS_TOPIC, self._on_hw, 10)
+        self.executor = SingleThreadedExecutor()
+        self.executor.add_node(self.node)
+        def spin():  # exits quietly when the executor is shut down at exit
+            try:
+                self.executor.spin()
+            except Exception:
+                pass
+        threading.Thread(target=spin, name="ros", daemon=True).start()
+
+    def _on_hw(self, msg):
+        try:
+            st = json.loads(msg.data)
+        except ValueError:
+            return
+        if st.get("stalls", 0) > self.stalls_seen or st.get("abort"):
+            self.last_stall = (time.monotonic(), ", ".join(st.get("stalled", {})) or "?")
+            flags = "; ".join(f"{j} {'/'.join(f)}" for j, f in st.get("flags", {}).items())
+            print(f"ARM {'ABORT (driver stopped)' if st.get('abort') else 'STALL'}: "
+                  f"{st.get('msg') or self.last_stall[1]}" + (f" [{flags}]" if flags else ""), flush=True)
+        self.stalls_seen = st.get("stalls", 0)
+        blocked = st.get("blocked", {})
+        for j, d in blocked.items():
+            if j not in self.blocked_seen:
+                print(f"ARM BLOCKED: {j} pushing {d} - won't push further that way", flush=True)
+        for j in self.blocked_seen:
+            if j not in blocked:
+                print(f"arm: {j} unblocked", flush=True)
+        self.blocked_seen = dict(blocked)
+        self.hw = (st, time.monotonic())
+
+    def arm_line(self):
+        """(text, alarm) about the arm driver for the preview; None without ROS."""
+        if self.node is None:
+            return None
+        if self.hw is None:
+            return "arm: no driver status (feetech_mirror not running?)", False
+        st, t = self.hw
+        if st.get("abort"):
+            return f"ARM ABORT: {st.get('msg') or ', '.join(st.get('stalled', {})) + ' stalled'}, driver stopped", True
+        if time.monotonic() - t > ARM_STALE_S:
+            return f"arm: no driver status for {time.monotonic() - t:.0f} s (driver stopped?)", True
+        flags = "; ".join(f"{j} {'/'.join(f)}" for j, f in st.get("flags", {}).items())
+        if st.get("holding"):
+            who = self.last_stall[1] if self.last_stall else "?"
+            return (f"ARM STALL: {who} not moving - holding {st.get('hold_left', 0):.1f} s"
+                    + (f" [{flags}]" if flags else ""), True)
+        if st.get("blocked"):
+            return ("ARM BLOCKED: " + ", ".join(f"{j} ({d})" for j, d in st["blocked"].items())
+                    + " - won't push further; move back to free it", True)
+        err = st.get("err_deg", {})
+        worst = max(err, key=lambda j: abs(err[j])) if err else None
+        text = (f"arm: {'live' if st.get('live') else 'dry run'} {st.get('hz', 0):.0f} Hz"
+                + (f", max lag {abs(err[worst]):.0f} deg ({worst})" if worst else ""))
+        if self.last_stall:
+            text += f", {st.get('stalls', 0)} stalls (last {self.last_stall[1]}, " \
+                    f"{time.monotonic() - self.last_stall[0]:.0f} s ago)"
+        return (text + f" [{flags}]", True) if flags else (text, False)
 
     def __call__(self, target):
         if self.node is not None:
@@ -133,6 +208,7 @@ class Publisher:
 
     def close(self):
         if self.node is not None:
+            self.executor.shutdown()
             self.node.destroy_node()
             self.rclpy.try_shutdown()
 
@@ -282,9 +358,23 @@ def main():
     ap.add_argument("--wilor-yolo-every", type=int, default=4,
                     help="wilor: run the hand detector every N frames (in between, boxes follow the keypoints)")
     ap.add_argument("--wilor-fp32", action="store_true", help="wilor: float32 (~3x slower)")
+    ap.add_argument("--wilor-yolo-sync", action="store_true",
+                    help="wilor: run the periodic detector re-check inline on the GPU (old behaviour) "
+                         "instead of on the CPU in its own thread")
+    ap.add_argument("--cam-fps", type=int, default=CAM_FPS, help="camera capture rate (preview rate)")
+    ap.add_argument("--size", type=int, nargs=2, default=None, metavar=("W", "H"),
+                    help=f"capture size (default live: {CAPTURE_SIZE[0]} {CAPTURE_SIZE[1]}; replays: the "
+                         "rig's calibrated size). The rig is scaled to it (same aspect ratio only), and the "
+                         "px settings (--reproj-px, --kf-sigma-px, filter presets) with it: they are given "
+                         "at the calibrated size")
+    ap.add_argument("--timing", action="store_true",
+                    help="print per-stage timings every 2 s (and show them in the preview)")
     ap.add_argument("--scale", type=float, default=1.0, help="arm m per hand m")
     ap.add_argument("--rot-scale", type=float, default=1.0,
                     help="multiplies all the rotation gains below")
+    ap.add_argument("--left-roll-gain", type=float, default=None,
+                    help="two hands: wrist_roll turn per left-hand turn (default: from the calibration's "
+                         f"quarter turn, 90 / measured, 1..{LEFT_ROLL_GAIN_MAX})")
     ap.add_argument("--roll-gain", type=float, nargs=2, default=None, metavar=("NEG", "POS"),
                     help="gripper roll per hand roll (about the forward axis), each direction; "
                          "gripper roll is 0..+90, so negative gains make -hand roll the "
@@ -327,6 +417,9 @@ def main():
     ap.add_argument("--mono-fallback", action="store_true",
                     help="track the palm from one camera when the other loses the hand")
     ap.add_argument("--no-view", action="store_true", help="no preview window")
+    ap.add_argument("--no-app", action="store_true",
+                    help="macOS: don't relaunch as the 'Hand Tracker' app (Dock icon, Cmd-Tab); the "
+                         "window then belongs to the terminal")
     ap.add_argument("--calib-up", action="store_true",
                     help="hand calibration: add a 'move ~15 cm straight up' step after forward, so robot up "
                          "comes from the hand instead of assuming level cameras (prints the camera tilt)")
@@ -383,6 +476,9 @@ def main():
     ap.add_argument("--roll-sign", type=float, default=1.0, choices=[1.0, -1.0],
                     help="two hands: -1 if wrist_roll turns the opposite way to the left hand")
     args = ap.parse_args()
+    if not args.no_view and not args.replay and not args.no_app:
+        macos_app.relaunch_in_app("Hand Tracker", "com.kh.handtracker")  # returns only inside the app
+        macos_app.register("Hand Tracker")  # Dock name + icon, to the front
     if args.two_hands and (args.record or args.replay):
         raise SystemExit("--two-hands: --record / --replay store one hand; use --record-frames / --replay-frames")
     if args.replay:
@@ -393,17 +489,24 @@ def main():
 
     try:
         rig = load_rig(args.rig)
-    except FileNotFoundError as e:
+        calib_size = tuple(int(v) for v in rig["size"])
+        # replays: their landmarks / frames are at the size they were recorded at (the rig's)
+        size = tuple(args.size) if args.size else (calib_size if replaying else CAPTURE_SIZE)
+        rig = scale_rig(rig, size)
+    except (FileNotFoundError, ValueError) as e:
         raise SystemExit(str(e))
-    est = h3.StereoHand(rig, reproj_px=args.reproj_px, mono_fallback=args.mono_fallback,
+    # px settings are tuned at the calibrated size; WiLoR's keypoint error scales with the image
+    # (it sees a crop around the hand), so they scale with the capture size
+    px_s = size[0] / calib_size[0]
+    est = h3.StereoHand(rig, reproj_px=args.reproj_px * px_s, mono_fallback=args.mono_fallback,
                         frame=args.frame, fit_mm=args.fit_mm, jump_deg=args.jump_deg)
-    size = tuple(int(v) for v in rig["size"])
-    print(f"stereo rig: {args.rig} ({rig['method']}), {size[0]}x{size[1]}, baseline "
-          f"{np.linalg.norm(rig['t']) * 100:.1f} cm")
+    print(f"stereo rig: {args.rig} ({rig['method']}), calibrated {calib_size[0]}x{calib_size[1]}, capture "
+          f"{size[0]}x{size[1]}" + (f" (scaled x{px_s:.2f})" if px_s != 1 else "") +
+          f", baseline {np.linalg.norm(rig['t']) * 100:.1f} cm")
     calib, mapper, grip_f = None, None, None
     # two hands: the left hand's own estimator / calibration / roll + grip filters
     two = args.two_hands
-    est_l = h3.StereoHand(rig, reproj_px=args.reproj_px, mono_fallback=False, frame=args.frame,
+    est_l = h3.StereoHand(rig, reproj_px=args.reproj_px * px_s, mono_fallback=False, frame=args.frame,
                           fit_mm=args.fit_mm, jump_deg=args.jump_deg) if two else None
     lcal = LeftHandCalibrator() if two else None
     roll_f = grip_l = None
@@ -442,12 +545,16 @@ def main():
         kalman = None
         f_px, base_m = float(rig["K0"][0, 0]), float(np.linalg.norm(rig["t"]))
         if args.pos_filter == "imm":
-            kalman = StereoIMM(f_px, base_m, **IMM_PRESETS[args.backend][args.imm])
+            imm = dict(IMM_PRESETS[args.backend][args.imm])
+            imm["sigma_px"] *= px_s
+            imm["ray_px"] *= px_s
+            imm["err_ref"] = 3.0 * px_s  # StereoKalman's default reprojection reference (px)
+            kalman = StereoIMM(f_px, base_m, **imm)
         elif args.pos_filter == "kalman":
             kf = KALMAN_DEFAULTS[args.backend]
-            kalman = StereoKalman(f_px, base_m, sigma_px=kf["sigma_px"] if args.kf_sigma_px is None else args.kf_sigma_px,
+            kalman = StereoKalman(f_px, base_m, sigma_px=px_s * (kf["sigma_px"] if args.kf_sigma_px is None else args.kf_sigma_px),
                                   q=kf["q"] if args.kf_q is None else args.kf_q, gate=args.kf_gate,
-                                  v_tau=args.kf_vtau)
+                                  v_tau=args.kf_vtau, err_ref=3.0 * px_s)
         still = None if args.still_hold is None else StillHold(args.still_hold, 3 * args.still_hold)
         mapper = HandMapper(res["A"], res["neutral_p"], res["neutral_R"], scale=args.scale,
                             rot_filter=tuple(args.rot_filter),
@@ -470,6 +577,7 @@ def main():
             raise SystemExit(f"{args.replay} was recorded with {replay.backend}, which this branch "
                              f"doesn't have (filter presets: {', '.join(BACKENDS)})")
         args.backend = replay.backend
+    T = Timers(enabled=args.timing)
     rec = Recorder(args.record, args.backend) if args.record else None
     frec = FrameRecorder(args.record_frames) if args.record_frames else None
     log = FrameLog(args.log, args) if args.log else None
@@ -481,7 +589,7 @@ def main():
         # backend first: WiLoR takes ~15 s to load, and missing packages fail before the cameras open
         lms = make_landmarks(args.backend, hand=args.wilor_hand, yolo_every=args.wilor_yolo_every,
                              fp32=args.wilor_fp32, warmup_size=size,  # MPS compiles per input shape
-                             hands=2 if two else 1)
+                             hands=2 if two else 1, yolo_async=not args.wilor_yolo_sync, timers=T)
         print(f"landmarks: {args.backend}")
         if args.replay_frames:
             cam = FrameReplay(args.replay_frames, realtime=not args.no_ros and not args.replay_live,
@@ -489,10 +597,11 @@ def main():
             print(f"replaying frames {args.replay_frames} ({len(cam.t)} pairs) through {args.backend}; "
                   f"recorded with: {cam.argv or '(defaults)'}")
         else:
-            cam = StereoCam(args.cams, size=size)  # the intrinsics only hold at the calibrated size
+            # the intrinsics only hold at the calibrated size
+            cam = StereoCam(args.cams, size=size, fps=args.cam_fps, timers=T)
             print("cameras:", cam.configure())
-    skew = None if args.no_skew_correct else h3.SkewCorrector()
-    skew_l = None if args.no_skew_correct or not two else h3.SkewCorrector()
+    skew = None if args.no_skew_correct else h3.SkewCorrector(max_speed_px=4000.0 * px_s)
+    skew_l = None if args.no_skew_correct or not two else h3.SkewCorrector(max_speed_px=4000.0 * px_s)
     lost_since, grip = None, None  # when the hand disappeared; filtered grip 0..1
     last_print, fps_n, fps_t, fps = 0.0, 0, time.monotonic(), 0.0
     target, why = None, ""
@@ -508,7 +617,13 @@ def main():
         old_roll = roll_f.cmd if roll_f is not None else 0.0
         # a clockwise hand turn = gripper roll + (as one-handed) = wrist_roll - (tool roll =
         # -wrist_roll, ik_solver.roll_sign); --roll-sign -1 flips it if the arm disagrees
-        roll_f = RollFilter(sign=-res["cw_sign"] * args.roll_sign, start=old_roll, axis=left_axis)
+        # gain: the calibration asked for a quarter turn and measured roll_deg of twist about
+        # the robot's forward axis; a hand turning about a tilted axis shows only part of it
+        # (90 deg read as ~45 on 2026-10-11), so the wrist turned half as far as the hand
+        gain = args.left_roll_gain or min(LEFT_ROLL_GAIN_MAX, max(1.0, 90.0 / max(res["roll_deg"], 1.0)))
+        print(f"left roll: calibration quarter turn measured {res['roll_deg']:.0f} deg -> gain {gain:.2f}"
+              + (" (--left-roll-gain)" if args.left_roll_gain else ""), flush=True)
+        roll_f = RollFilter(sign=-res["cw_sign"] * args.roll_sign, scale=gain, start=old_roll, axis=left_axis)
         old_grip = grip_l.grip if grip_l is not None else None
         grip_l = GripFilter(grip_open, args.grip_closed_curl, hold_deg=args.grip_hold_deg,
                             band=args.grip_band, tau=GRIP_TAU, max_dt=HandMapper.MAX_DT)
@@ -516,13 +631,14 @@ def main():
         print(f"left hand: wrist_roll from its twist ({lcal.msg}), gripper open at curl >= {grip_open:.2f}, "
               f"closed at <= {args.grip_closed_curl:.2f}", flush=True)
 
-    def process_left(t):
+    def process_left(s):
         """Two hands: the left hand -> wrist_roll + gripper. Returns ((px0, px1), status)."""
         nonlocal lcal
-        l0, l1 = lms.other if lms.other_fresh else (None, None)
+        t, fresh = s["t"], s["other_fresh"]
+        l0, l1 = s["other"] if fresh else (None, None)
         lpose = None
-        if lms.other_fresh:
-            l1s = l1 if skew_l is None else skew_l(l1, cam.t1, cam.t0)
+        if fresh:
+            l1s = l1 if skew_l is None else skew_l(l1, s["t1"], s["t0"])
             lpose, _ = est_l.estimate(l0, l1s, t)
         if calib is not None:
             return (l0, l1), "left: calibrates after the right hand"
@@ -540,7 +656,7 @@ def main():
             line = f"LEFT {st:<6} roll {math.degrees(cmd):+4.0f} deg" + (
                 f"  grip {g:.2f}{'H' if grip_l.held else ' '}" if g is not None else "")
         else:
-            if lms.other_fresh:
+            if fresh:
                 roll_f.lost(t)
             line = f"LEFT none   roll {math.degrees(roll_f.cmd):+4.0f} deg (holding)"
         pub.roll(roll_f.cmd)  # every pair, also while hidden: the IK keeps wrist_roll locked
@@ -555,23 +671,42 @@ def main():
             if r is not None:
                 r.mark_recal()
 
-    def process_pair():
-        """One stereo pair: landmarks -> pose -> calibration / mapping -> publish + terminal
-        line. Returns what the preview draws, or None when no pair came."""
-        nonlocal calib, lost_since, grip, last_print, fps_n, fps_t, fps, target, why
-        pr = cam.pair()
+    def sense():
+        """Stage 1 (the gpu thread when live): a stereo pair -> landmarks. Returns everything
+        stage 2 needs (capture times and the other hand copied here: the next pair changes
+        them), or None when no pair came."""
+        with T("gpu.pair_wait"):
+            pr = cam.pair()
         if pr is None:
             return None
         f0, f1, t = pr
+        t0, t1 = cam.t0, cam.t1
         if frec is not None:
-            frec.add(f0, f1, t, cam.t0, cam.t1)
-        px0, px1_raw = lms(f0, f1, t)
+            frec.add(f0, f1, t, t0, t1)
+        with T("gpu.landmarks"):
+            px0, px1 = lms(f0, f1, t)
+        T.tick("pairs")
+        return dict(f0=f0, f1=f1, t=t, t0=t0, t1=t1, px0=px0, px1=px1,
+                    other=getattr(lms, "other", (None, None)), other_fresh=getattr(lms, "other_fresh", False))
+
+    def process_pair():
+        """One pair through both stages (replays: one thread, deterministic)."""
+        s = sense()
+        return None if s is None else think(s)
+
+    def think(s):
+        """Stage 2 (the pose thread when live): landmarks -> pose -> calibration / mapping ->
+        publish + terminal line. Returns what the preview draws."""
+        nonlocal calib, lost_since, grip, last_print, fps_n, fps_t, fps, target, why
+        f0, f1, t, px0, px1_raw = s["f0"], s["f1"], s["t"], s["px0"], s["px1"]
         if rec is not None:
-            rec.add(t, cam.t0, cam.t1, px0, px1_raw)
-        px1 = px1_raw if skew is None else skew(px1_raw, cam.t1, cam.t0)
-        pose, why = est.estimate(px0, px1, t)
+            rec.add(t, s["t0"], s["t1"], px0, px1_raw)
+        with T("pose.estimate"):
+            px1 = px1_raw if skew is None else skew(px1_raw, s["t1"], s["t0"])
+            pose, why = est.estimate(px0, px1, t)
         status = ""
         published = False
+        t_map = time.perf_counter()
 
         if calib is not None:
             if calib.feed(pose, t):
@@ -616,7 +751,11 @@ def main():
             jitter.clear()
             status = f"no hand (clutch: holding): {why}"
 
-        left_px, left_line = process_left(t) if two else ((None, None), "")
+        T.add("pose.map_publish", time.perf_counter() - t_map)
+        left_px, left_line = (None, None), ""
+        if two:
+            with T("pose.left"):
+                left_px, left_line = process_left(s)
 
         if time.monotonic() - last_print > 0.5:
             last_print = time.monotonic()
@@ -640,44 +779,76 @@ def main():
         if time.monotonic() - fps_t > 1.0:
             fps, fps_n, fps_t = fps_n / (time.monotonic() - fps_t), 0, time.monotonic()
         return dict(f0=f0, f1=f1, px0=px0, px1=px1_raw, pose=pose, status=status, fps=fps,
-                    skew_ms=(cam.t1 - cam.t0) * 1000,
+                    skew_ms=(s["t1"] - s["t0"]) * 1000,
                     target=target if calib is None else None, left_px=left_px, left_line=left_line)
 
     def show(f0, f1, snap, cam_fps=None):
-        """Draw snap's landmarks / pose / text on f0, f1 and show them. Returns the key."""
-        draw_hand(f0, snap["px0"])
-        draw_hand(f1, snap["px1"])
-        draw_hand(f0, snap["left_px"][0], LEFT_COLOR)
-        draw_hand(f1, snap["left_px"][1], LEFT_COLOR)
-        if snap["pose"] is not None:
-            draw_axes(f0, snap["pose"], rig["K0"], rig["d0"])
-        view = np.hstack([f0, f1])
-        rate = f"{snap['fps']:.0f} fps" if cam_fps is None else \
-            f"model {snap['fps']:.0f} pairs/s, view {cam_fps:.0f} fps"
-        lines = [snap["status"], f"{rate}, skew {snap['skew_ms']:+.0f} ms"]
-        if snap["target"] is not None:
-            x, y, z, r, p, yw = snap["target"]
-            lines.append(f"offset cm x{x * 100:+.1f} y{y * 100:+.1f} z{z * 100:+.1f}  "
-                         f"rpy deg {math.degrees(r):+.0f} {math.degrees(p):+.0f} "
-                         f"{math.degrees(yw):+.0f}")
-        if snap["left_line"]:
-            lines.append(snap["left_line"])
-        for i, s in enumerate(lines):
-            cv2.putText(view, s, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
-                        (0, 0, 255) if snap["pose"] is None else (0, 255, 255), 2)
-        cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", fit_view(view))
-        return cv2.waitKey(1) & 0xFF
+        """Draw snap's landmarks / pose / text on f0, f1 (not changed) and show them. Each view
+        is shrunk to PREVIEW_W first, then drawn on (a 1080p pair at full size cost copies and a
+        3840 px resize at 60 fps). Returns the key."""
+        with T("view.draw"):
+            s = min(1.0, PREVIEW_W / f0.shape[1])
+            f0, f1 = (cv2.resize(f, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR) if s < 1 else f.copy()
+                      for f in (f0, f1))
+            sc = lambda px: None if px is None else px * s  # noqa: E731
+            draw_hand(f0, sc(snap["px0"]))
+            draw_hand(f1, sc(snap["px1"]))
+            draw_hand(f0, sc(snap["left_px"][0]), LEFT_COLOR)
+            draw_hand(f1, sc(snap["left_px"][1]), LEFT_COLOR)
+            if snap["pose"] is not None:
+                K = np.array(rig["K0"], dtype=float)
+                K[:2] *= s
+                draw_axes(f0, snap["pose"], K, rig["d0"])
+            view = np.hstack([f0, f1])
+            rate = f"{snap['fps']:.0f} fps" if cam_fps is None else \
+                f"model {snap['fps']:.0f} pairs/s, view {cam_fps:.0f} fps"
+            lines = [snap["status"], f"{rate}, skew {snap['skew_ms']:+.0f} ms"]
+            if snap["target"] is not None:
+                x, y, z, r, p, yw = snap["target"]
+                lines.append(f"offset cm x{x * 100:+.1f} y{y * 100:+.1f} z{z * 100:+.1f}  "
+                             f"rpy deg {math.degrees(r):+.0f} {math.degrees(p):+.0f} "
+                             f"{math.degrees(yw):+.0f}")
+            if snap["left_line"]:
+                lines.append(snap["left_line"])
+            if args.timing and T.last:
+                lines.append("ms " + T.summary(["wilor.forward", "wilor.yolo", "wilor.crop", "wilor.post",
+                                                "gpu.pair_wait", "pose.total", "view.draw", "view.imshow"]))
+            for i, line in enumerate(lines):
+                cv2.putText(view, line, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
+                            (0, 0, 255) if snap["pose"] is None else (0, 255, 255), 2)
+            arm = pub.arm_line()
+            if arm is not None:  # the driver's state, red on a stall / abort / servo protection
+                text, alarm = arm
+                y = 25 + 28 * len(lines)
+                if alarm:
+                    (w, h), _ = cv2.getTextSize(text, cv2.FONT_HERSHEY_SIMPLEX, 0.75, 2)
+                    cv2.rectangle(view, (4, y - h - 8), (16 + w, y + 8), (0, 0, 160), -1)
+                cv2.putText(view, text, (10, y), cv2.FONT_HERSHEY_SIMPLEX, 0.75 if alarm else 0.6,
+                            (255, 255, 255) if alarm else (200, 200, 200), 2)
+        with T("view.imshow"):
+            cv2.imshow("hand -> /ball_position (q quits, c recalibrates)", view)
+            return cv2.waitKey(1) & 0xFF
 
-    # live cameras with a window: WiLoR and everything after it run in a worker thread, the
-    # main thread (macOS: windows only work there) shows the newest camera frames at camera
-    # rate with the newest result drawn on them. Replays and --no-view stay single-threaded
-    # (deterministic, same output as before).
-    threaded = not args.no_view and not replaying and isinstance(cam, StereoCam)
-    worker, stop = None, threading.Event()
+    next_report = [time.monotonic() + 2.0]
+
+    def report_timing():
+        if args.timing and time.monotonic() >= next_report[0]:
+            next_report[0] = time.monotonic() + 2.0
+            print(T.report(), flush=True)
+
+    # live cameras: three pipeline threads (+ one per camera, + the CPU YOLO re-check):
+    #   gpu:  pair + WiLoR (sense)               -> queue (1 deep: back-pressure, no backlog)
+    #   pose: triangulate, calibrate / map, publish (think), overlapping the next forward pass
+    #   main: (macOS: windows only work here) the newest camera frames at camera rate with the
+    #         newest result drawn on them; without a window it only waits.
+    # Replays stay single-threaded (deterministic, same output as before).
+    threaded = not replaying and isinstance(cam, StereoCam)
+    workers, stop = [], threading.Event()
     try:
         if not threaded:
             while True:
                 snap = process_pair()
+                report_timing()
                 if snap is None or args.no_view:
                     continue
                 k = show(snap["f0"], snap["f1"], snap)
@@ -687,26 +858,55 @@ def main():
                     recalibrate()
         else:
             lock, latest, failed, want_recal = threading.Lock(), [None], [], threading.Event()
+            handoff = queue.Queue(maxsize=1)
 
-            def work():
-                try:
-                    while not stop.is_set():
-                        if want_recal.is_set():
-                            want_recal.clear()
-                            recalibrate()
-                        snap = process_pair()
-                        if snap is not None:
-                            with lock:
-                                latest[0] = snap
-                except BaseException as e:  # shown and re-raised by the main thread
-                    failed.append(e)
-                    stop.set()
+            def guarded(fn):
+                def run():
+                    try:
+                        fn()
+                    except BaseException as e:  # shown and re-raised by the main thread
+                        failed.append(e)
+                        stop.set()
+                return run
 
-            worker = threading.Thread(target=work, name="hand-pipeline", daemon=True)
-            worker.start()
+            def gpu_loop():
+                while not stop.is_set():
+                    s = sense()
+                    if s is None:
+                        continue
+                    with T("gpu.handoff"):  # long = the pose thread is the bottleneck
+                        while not stop.is_set():
+                            try:
+                                handoff.put(s, timeout=0.1)
+                                break
+                            except queue.Full:
+                                pass
+
+            def pose_loop():
+                while not stop.is_set():
+                    if want_recal.is_set():
+                        want_recal.clear()
+                        recalibrate()
+                    try:
+                        s = handoff.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    with T("pose.total"):
+                        snap = think(s)
+                    with lock:
+                        latest[0] = snap
+
+            for name, fn in (("gpu", gpu_loop), ("pose", pose_loop)):
+                workers.append(threading.Thread(target=guarded(fn), name=name, daemon=True))
+                workers[-1].start()
             seq, view_n, view_t, view_fps = -1, 0, time.monotonic(), 0.0
             while not stop.is_set():
-                f0, _, s0 = cam.c0.wait_new(seq, timeout=0.2)
+                report_timing()
+                if args.no_view:
+                    stop.wait(0.1)
+                    continue
+                with T("view.wait"):
+                    f0, _, s0 = cam.c0.wait_new(seq, timeout=0.2)
                 if f0 is None or s0 == seq:
                     continue
                 seq = s0
@@ -716,10 +916,10 @@ def main():
                 if f1 is None or snap is None:
                     continue
                 view_n += 1
+                T.tick("view frames")
                 if time.monotonic() - view_t > 1.0:
                     view_fps, view_n, view_t = view_n / (time.monotonic() - view_t), 0, time.monotonic()
-                # copies: the worker may be reading these same frames
-                k = show(f0.copy(), f1.copy(), snap, view_fps)
+                k = show(f0, f1, snap, view_fps)  # draws on shrunk copies, not on these frames
                 if k in (ord("q"), 27):
                     break
                 if k == ord("c"):
@@ -730,8 +930,8 @@ def main():
         pass
     finally:
         stop.set()
-        if worker is not None:
-            worker.join(timeout=5.0)  # finish the pair in flight before closing cameras / ROS
+        for w in workers:
+            w.join(timeout=5.0)  # finish the pair in flight before closing cameras / ROS
         for r in (rec, frec):
             if r is not None:
                 r.save()

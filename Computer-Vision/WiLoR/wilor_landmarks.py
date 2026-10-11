@@ -37,8 +37,16 @@ Extras for later phases (MANO rotation, single-view 3D): self.last[view] =
 {"box", "is_right", "conf", "global_orient" (3x3, in the crop's camera, mirrored
 for left hands), "kp3d" (21x3 m, same frame), "cam_t"} or None.
 
-Speed: on the old RTX 2060 (fp16, bench_wilor.py) 47 ms for both views (~21 Hz) + ~9 ms
-for a YOLO pass; on the Mac (MPS) not measured yet: run bench_wilor.py. Needs torch,
+Async re-check (yolo_async, default, one hand): the every-`yolo_every` YOLO pass on tracked
+views runs on the CPU in its own thread (AsyncDetector), next to the WiLoR forward pass on
+the GPU instead of before it; its result arrives a pair or two later and only confirms the
+track (the keypoint box stays), drops it (no hand: re-detected at once, on the GPU) or
+replaces it (another hand). YOLO on the GPU stays for views without a track.
+
+Speed (M5 Pro, MPS, fp16, 2026-10-10): both views 48-50 ms with torch 2.14.1 (83 ms with
+2.5.1: upgrade torch), YOLO both views 15 ms on the GPU, 57 ms on the CPU (async thread).
+self.timers (common/timing.Timers) times each stage: wilor.yolo / crop / forward / post,
+yolo.cpu. Old RTX 2060: 47 ms for both views + ~9 ms per YOLO pass. Needs torch,
 ultralytics and repo/'s requirements in the conda env, and repo/ (weights + mano_data,
 gitignored). If an op isn't implemented on MPS: PYTORCH_ENABLE_MPS_FALLBACK=1 (that op runs
 on the CPU) or fp32=True.
@@ -48,12 +56,16 @@ Self-test (no cameras, demo images): python Computer-Vision/WiLoR/wilor_landmark
 import math
 import os
 import sys
+import threading
 
 import cv2
 import numpy as np
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.join(HERE, "repo")
+if os.path.join(os.path.dirname(HERE), "common") not in sys.path:
+    sys.path.insert(0, os.path.join(os.path.dirname(HERE), "common"))  # timing (run standalone)
+from timing import NULL as NULL_TIMERS  # noqa: E402
 CROP = 256
 MEAN = np.array([0.485, 0.456, 0.406]) * 255.0
 STD = np.array([0.229, 0.224, 0.225]) * 255.0
@@ -130,14 +142,77 @@ def _iou(a, b):
     return inter / max(area(a) + area(b) - inter, 1e-9)
 
 
+def _parse_dets(r, hand):
+    """One ultralytics result -> [(box, is_right, conf)], filtered to hand ("any" / "right" / "left")."""
+    b = r.boxes
+    xyxy = b.xyxy.cpu().numpy().astype(float)
+    cls = b.cls.cpu().numpy().astype(int)
+    cf = b.conf.cpu().numpy().astype(float)
+    dets = [(tuple(xyxy[i]), bool(cls[i] == 1), float(cf[i])) for i in range(len(cf))]
+    if hand != "any":
+        dets = [d for d in dets if d[1] == (hand == "right")]
+    return dets
+
+
+class AsyncDetector:
+    """The YOLO hand detector on the CPU in its own thread. submit() hands it frames when
+    it's idle (copies: the caller may draw on them); take() returns the finished
+    (views, per-view detections) once, or None."""
+
+    def __init__(self, conf, imgsz, hand, timers):
+        from ultralytics import YOLO
+        self.model = YOLO(os.path.join(REPO, "pretrained_models", "detector.pt"))
+        self.model.to("cpu")
+        self.conf, self.imgsz, self.hand, self.timers = conf, imgsz, hand, timers
+        self.cond = threading.Condition()
+        self.job = self.result = None
+        self.busy, self.running = False, True
+        self.model([np.zeros((64, 64, 3), np.uint8)], verbose=False, imgsz=imgsz, device="cpu")  # warm-up
+        self.thread = threading.Thread(target=self._run, name="yolo-cpu", daemon=True)
+        self.thread.start()
+
+    def submit(self, views, frames):
+        with self.cond:
+            if self.busy:
+                return False
+            self.job, self.busy = (list(views), [f.copy() for f in frames]), True
+            self.cond.notify()
+            return True
+
+    def take(self):
+        with self.cond:
+            r, self.result = self.result, None
+            return r
+
+    def _run(self):
+        while True:
+            with self.cond:
+                self.cond.wait_for(lambda: self.job is not None or not self.running)
+                if not self.running:
+                    return
+                (views, frames), self.job = self.job, None
+            with self.timers("yolo.cpu"):
+                res = self.model(frames, verbose=False, conf=self.conf, imgsz=self.imgsz, device="cpu")
+                dets = [_parse_dets(r, self.hand) for r in res]
+            with self.cond:
+                self.result, self.busy = (views, dets), False
+
+    def close(self):
+        with self.cond:
+            self.running = False
+            self.cond.notify()
+        self.thread.join(timeout=2.0)
+
+
 class StereoLandmarks:
     """WiLoR on both views, one hand. hand: 'any', 'right' or 'left' (the user's hand)."""
 
     def __init__(self, yolo_every=4, conf=0.3, conf_start=0.5, rescale=2.0, hand="any", yolo_size=320,
                  device=None, fp32=False, warmup_size=(640, 480), max_size_jump=1.55, max_shift=0.6,
-                 hands=1, other_every=1):
+                 hands=1, other_every=1, yolo_async=True, timers=None):
         import torch
         self.torch = torch
+        self.timers = timers or NULL_TIMERS
         self.model, self.detector, self.dev, self.dtype = load_models(device, fp32)
         self.mean = torch.tensor(MEAN, device=self.dev, dtype=self.dtype).view(1, 3, 1, 1)
         self.std = torch.tensor(STD, device=self.dev, dtype=self.dtype).view(1, 3, 1, 1)
@@ -164,6 +239,9 @@ class StereoLandmarks:
         self.redetect2 = {s: [False, False] for s in ("right", "left")}
         self.last2 = {s: [None, None] for s in ("right", "left")}
         self.other, self.other_fresh = (None, None), False
+        # periodic re-check on the CPU, next to the GPU (one hand only; two hands keep it inline)
+        self.async_det = AsyncDetector(conf, yolo_size, hand, self.timers) if yolo_async and hands == 1 else None
+        self.async_n = 0  # call of the last submit / inline detection
         if warmup_size:
             self.warmup(warmup_size)
 
@@ -188,19 +266,53 @@ class StereoLandmarks:
         """Per frame: list of (box, is_right, conf), YOLO in one batch. hand: filter
         ("any" / "right" / "left"), default self.hand."""
         hand = self.hand if hand is None else hand
-        # device explicitly: ultralytics picks CUDA or the CPU by itself, never MPS
-        res = self.detector(list(frames), verbose=False, conf=self.conf, imgsz=self.yolo_size, device=self.dev)
-        out = []
-        for r in res:
-            b = r.boxes
-            xyxy = b.xyxy.cpu().numpy().astype(float)
-            cls = b.cls.cpu().numpy().astype(int)
-            cf = b.conf.cpu().numpy().astype(float)
-            dets = [(tuple(xyxy[i]), bool(cls[i] == 1), float(cf[i])) for i in range(len(cf))]
-            if hand != "any":
-                dets = [d for d in dets if d[1] == (hand == "right")]
-            out.append(dets)
-        return out
+        with self.timers("wilor.yolo"):
+            # device explicitly: ultralytics picks CUDA or the CPU by itself, never MPS
+            res = self.detector(list(frames), verbose=False, conf=self.conf, imgsz=self.yolo_size, device=self.dev)
+            return [_parse_dets(r, hand) for r in res]
+
+    def _merge_async(self, fresh):
+        """Apply a finished async re-check: same hand -> keep the (newer) keypoint box, take
+        the conf; no hand -> drop the track (this call re-detects inline); another hand ->
+        restart the track on it (fresh[v]: no sudden-change check this call)."""
+        r = self.async_det.take()
+        if r is None:
+            return
+        for v, dets in zip(*r):
+            tr = self.track[v]
+            if tr is None:
+                continue  # lost meanwhile: re-detected inline
+            other = self.track[1 - v]
+            pick = self._pick(dets, tr, other and other["is_right"])
+            if pick is None:
+                self.track[v] = None
+            elif _iou(pick[0], tr["box"]) > 0.1:
+                tr["conf"] = pick[2]
+            else:
+                self.track[v] = {"box": pick[0], "is_right": pick[1], "conf": pick[2]}
+                fresh[v] = True
+
+    def _infer(self, crops):
+        """WiLoR on a batch of RGB crops -> numpy (kp2 (k,21,2), kp3 (k,21,3), global_orient
+        (k,3,3), cam_t (k,3)). One device -> CPU copy: every .cpu() waits for the GPU."""
+        torch, k = self.torch, len(crops)
+        with self.timers("wilor.forward"), torch.inference_mode():
+            x = torch.from_numpy(np.ascontiguousarray(np.stack(crops))).to(self.dev)
+            x = (x.permute(0, 3, 1, 2).to(self.dtype) - self.mean) / self.std
+            out = self.model({"img": x})
+            flat = torch.cat([out["pred_keypoints_2d"].reshape(k, -1).float(),
+                              out["pred_keypoints_3d"].reshape(k, -1).float(),
+                              out["pred_mano_params"]["global_orient"].reshape(k, -1).float(),
+                              out["pred_cam_t"].reshape(k, -1).float()], 1).cpu().numpy()
+        return (flat[:, :42].reshape(k, 21, 2), flat[:, 42:105].reshape(k, 21, 3),
+                flat[:, 105:114].reshape(k, 3, 3), flat[:, 114:117])
+
+    def _crop(self, frame, box, flip):
+        """(RGB crop, meta (cx, cy, size, flip)) for a hand box."""
+        cx, cy, size = square_box(*box, self.rescale)
+        img = cv2.warpAffine(frame, crop_matrix(cx, cy, size, flip), (CROP, CROP),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
+        return img[:, :, ::-1], (cx, cy, size, flip)  # BGR -> RGB
 
     def _pick(self, dets, track, prefer_right=None):
         if not dets:
@@ -229,9 +341,20 @@ class StereoLandmarks:
             return self._call2((f0, f1))
         frames = (f0, f1)
         self.n += 1
-        need = [self.track[v] is None or self.n % self.yolo_every == 1 or self.redetect[v]
+        fresh = [False, False]  # track restarted by an async result: like need[v] below
+        if self.async_det is not None:
+            self._merge_async(fresh)
+        periodic = self.n % self.yolo_every == 1 and self.async_det is None
+        need = [self.track[v] is None or periodic or self.redetect[v]
                 or not self._plausible(self.track[v], frames[v].shape) for v in (0, 1)]
         self.redetect = [False, False]
+        if self.async_det is not None:
+            tracked = [v for v in (0, 1) if self.track[v] is not None and not need[v]]
+            if any(need):
+                self.async_n = self.n
+            elif tracked and self.n - self.async_n >= self.yolo_every \
+                    and self.async_det.submit(tracked, [frames[v] for v in tracked]):
+                self.async_n = self.n
         if any(need):
             dets = self._detect([frames[v] for v in (0, 1) if need[v]])
             it = iter(dets)
@@ -251,48 +374,38 @@ class StereoLandmarks:
         self.last = [None, None]
         if not views:
             return None, None
-        crops, metas = [], []
-        for v in views:
-            tr = self.track[v]
-            cx, cy, size = square_box(*tr["box"], self.rescale)
-            flip = not tr["is_right"]
-            img = cv2.warpAffine(frames[v], crop_matrix(cx, cy, size, flip), (CROP, CROP),
-                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-            crops.append(img[:, :, ::-1])  # BGR -> RGB
-            metas.append((cx, cy, size, flip))
-
-        torch = self.torch
-        with torch.inference_mode():
-            x = torch.from_numpy(np.ascontiguousarray(np.stack(crops))).to(self.dev)
-            x = (x.permute(0, 3, 1, 2).to(self.dtype) - self.mean) / self.std
-            out = self.model({"img": x})
-            kp2 = out["pred_keypoints_2d"].float().cpu().numpy()
-            kp3 = out["pred_keypoints_3d"].float().cpu().numpy()
-            rot = out["pred_mano_params"]["global_orient"].float().cpu().numpy().reshape(len(views), 3, 3)
-            cam_t = out["pred_cam_t"].float().cpu().numpy()
+        with self.timers("wilor.crop"):
+            crops, metas = zip(*(self._crop(frames[v], self.track[v]["box"], not self.track[v]["is_right"])
+                                 for v in views))
+        kp2, kp3, rot, cam_t = self._infer(crops)
 
         px = [None, None]
-        for i, v in enumerate(views):
-            cx, cy, size, flip = metas[i]
-            p = crop_to_frame(kp2[i], cx, cy, size, flip)
-            if not np.all(np.isfinite(p)):
-                self.track[v] = None
-                continue
-            tr = self.track[v]
-            box = (p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max())
-            if not need[v] and self._sudden(self.good[v], box):
-                # keep the last good box, drop this view's keypoints, re-detect next call
-                tr["box"] = self.good[v]
-                self.redetect[v] = True
-                self.rejected[v] += 1
-                continue
-            self.good[v] = box
-            px[v] = p
-            self.last[v] = {"box": tr["box"], "is_right": tr["is_right"], "conf": tr["conf"],
-                            "global_orient": rot[i], "kp3d": kp3[i], "cam_t": cam_t[i]}
-            # next call's box: around these keypoints (YOLO checks it every yolo_every calls)
-            tr["box"] = box
+        with self.timers("wilor.post"):
+            for i, v in enumerate(views):
+                px[v] = self._accept(v, crop_to_frame(kp2[i], *metas[i]), need[v] or fresh[v],
+                                     rot[i], kp3[i], cam_t[i])
         return px[0], px[1]
+
+    def _accept(self, v, p, detected, rot, kp3, cam_t):
+        """Frame keypoints p of view v -> p, or None (non-finite / sudden change of a
+        keypoint-tracked view); updates the track's box for the next call."""
+        if not np.all(np.isfinite(p)):
+            self.track[v] = None
+            return None
+        tr = self.track[v]
+        box = (p[:, 0].min(), p[:, 1].min(), p[:, 0].max(), p[:, 1].max())
+        if not detected and self._sudden(self.good[v], box):
+            # keep the last good box, drop this view's keypoints, re-detect next call
+            tr["box"] = self.good[v]
+            self.redetect[v] = True
+            self.rejected[v] += 1
+            return None
+        self.good[v] = box
+        self.last[v] = {"box": tr["box"], "is_right": tr["is_right"], "conf": tr["conf"],
+                        "global_orient": rot, "kp3d": kp3, "cam_t": cam_t}
+        # next call's box: around these keypoints (YOLO checks it every yolo_every calls)
+        tr["box"] = box
+        return p
 
     # -- two hands -----------------------------------------------------------
     def _assign2(self, dets, v, fresh_sides):
@@ -368,23 +481,9 @@ class StereoLandmarks:
                     self.last2[s][v] = None
         px = {s: [None, None] for s in sides}
         if jobs:
-            crops, metas = [], []
-            for s, v in jobs:
-                cx, cy, size = square_box(*self.tr2[s][v]["box"], self.rescale)
-                flip = s == "left"
-                img = cv2.warpAffine(frames[v], crop_matrix(cx, cy, size, flip), (CROP, CROP),
-                                     flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT)
-                crops.append(img[:, :, ::-1])
-                metas.append((cx, cy, size, flip))
-            torch = self.torch
-            with torch.inference_mode():
-                x = torch.from_numpy(np.ascontiguousarray(np.stack(crops))).to(self.dev)
-                x = (x.permute(0, 3, 1, 2).to(self.dtype) - self.mean) / self.std
-                out = self.model({"img": x})
-                kp2 = out["pred_keypoints_2d"].float().cpu().numpy()
-                kp3 = out["pred_keypoints_3d"].float().cpu().numpy()
-                rot = out["pred_mano_params"]["global_orient"].float().cpu().numpy().reshape(len(jobs), 3, 3)
-                cam_t = out["pred_cam_t"].float().cpu().numpy()
+            with self.timers("wilor.crop"):
+                crops, metas = zip(*(self._crop(frames[v], self.tr2[s][v]["box"], s == "left") for s, v in jobs))
+            kp2, kp3, rot, cam_t = self._infer(crops)
             for i, (s, v) in enumerate(jobs):
                 p = crop_to_frame(kp2[i], *metas[i])
                 tr = self.tr2[s][v]
@@ -419,12 +518,13 @@ class StereoLandmarks:
         return not (1 / self.max_size_jump < r < self.max_size_jump) or shift > self.max_shift * size(ref)
 
     def close(self):
-        pass
+        if self.async_det is not None:
+            self.async_det.close()
 
 
 def _selftest():
     import glob
-    lms = StereoLandmarks()
+    lms = StereoLandmarks(yolo_async=False)  # the mirror check below seeds tracks for an inline pass
     imgs = sorted(glob.glob(os.path.join(REPO, "demo_img", "*")))
     ok = 0
     for path in imgs:
@@ -461,7 +561,40 @@ def _selftest():
         ok += 1
     assert ok >= 3, f"only {ok} demo images gave a hand"
     print(f"wilor_landmarks self-test OK ({ok} images)")
+    lms.close()
+    _selftest_async(imgs)
     _selftest_two(imgs)
+
+
+def _selftest_async(imgs):
+    """Async re-check: the same image over and over keeps the hand, the CPU detector's
+    results get merged (track conf from YOLO), and the keypoints match the inline run."""
+    import time
+    ref = StereoLandmarks(yolo_async=False, warmup_size=None)
+    lms = StereoLandmarks(yolo_async=True, warmup_size=None, yolo_every=2)
+    for path in imgs:
+        img = cv2.imread(path)
+        if img is None:
+            continue
+        img = cv2.resize(img, (640, int(640 * img.shape[0] / img.shape[1])))
+        p_ref, _ = ref(img, img)
+        if p_ref is None:
+            continue
+        merged = 0
+        for _ in range(10):
+            p0, _ = lms(img, img)  # merges the previous CPU pass
+            assert p0 is not None, f"{os.path.basename(path)}: hand lost with the async re-check"
+            time.sleep(0.15)  # let the CPU detector finish
+            merged += lms.async_det.result is not None
+        lms.close()
+        size = max(np.ptp(p_ref[:, 0]), np.ptp(p_ref[:, 1]))
+        err = np.median(np.linalg.norm(p0 - p_ref, axis=1))
+        assert merged >= 3, f"async detector finished only {merged} times"
+        assert err < 0.1 * size, f"async run differs from the inline one ({err:.1f} px)"
+        print(f"async re-check self-test OK ({os.path.basename(path)}: {merged} CPU passes, "
+              f"{err:.1f} px vs inline)")
+        return
+    raise AssertionError("no demo image gave a hand")
 
 
 def _selftest_two(imgs):

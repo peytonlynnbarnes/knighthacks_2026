@@ -3,8 +3,12 @@
 #   python -c "import numpy; print(f'numpy=={numpy.__version__}')" > /tmp/numpy-pin.txt
 #   pip install -r requirements.txt -c /tmp/numpy-pin.txt
 #   pip install --no-build-isolation git+https://github.com/mattloper/chumpy   # MANO loading
-# Versions pinned below are the ones WiLoR ran with on the old machine (torch 2.5.1:
-# newer torch defaults torch.load to weights_only=True, which the checkpoints don't pass).
+#   # torch's own OpenMP runtime clashes with conda's ("OMP: Error #15", abort): use conda's
+#   T=$(python -c "import os, torch; print(os.path.dirname(torch.__file__))")/lib
+#   mv $T/libomp.dylib $T/libomp.dylib.orig && ln -s $CONDA_PREFIX/lib/libomp.dylib $T/libomp.dylib
+# torch 2.14.1 (2026-10-11): WiLoR on MPS 48 ms for both views vs 83 ms with 2.5.1. Its
+# torch.load defaults to weights_only=True, which ultralytics < 8.4 can't load detector.pt
+# with: ultralytics 8.4.175 handles it (the WiLoR checkpoint loads fine through Lightning).
 
 # servos
 feetech-servo-sdk==1.0.0
@@ -18,9 +22,9 @@ pyyaml                 # rclpy needs it when ROS is used from this env (feetech_
 opencv-python<4.12
 
 # WiLoR (Computer-Vision/WiLoR/; weights + MANO in WiLoR/repo/, copied by hand, never committed)
-torch==2.5.1
-torchvision==0.20.1
-ultralytics==8.1.34    # the YOLO hand detector (repo/pretrained_models/detector.pt)
+torch==2.14.1
+torchvision==0.29.1
+ultralytics==8.4.175   # the YOLO hand detector (repo/pretrained_models/detector.pt)
 pytorch-lightning
 smplx==0.1.28
 timm

@@ -6,8 +6,8 @@ Each camera runs in its own thread and keeps its latest two frames with
 capture timestamps. pair() waits for a new frame from cam0 and pairs it with
 cam1's nearest frame in time (previous, latest, or the next one if that will
 be closer); the pair is rejected if they're more than max_dt apart. The
-cameras aren't hardware-synced (both free-run at ~30 fps, so a pair is up to
-~17 ms apart); hand3d.SkewCorrector shifts cam1's landmarks to cam0's time for the rest.
+cameras aren't hardware-synced (both free-run at CAM_FPS, 60: a pair is up to
+~8 ms apart); hand3d.SkewCorrector shifts cam1's landmarks to cam0's time for the rest.
 
 Camera settings: macOS (AVFoundation through OpenCV) can't set exposure, white
 balance or focus, so the cameras run on auto exposure / auto white balance,
@@ -39,6 +39,8 @@ import time
 import cv2
 import numpy as np
 
+from timing import NULL as NULL_TIMERS
+
 HERE = os.path.dirname(os.path.abspath(__file__))
 CV_DIR = os.path.dirname(HERE)  # Computer-Vision/: common/ (this), WiLoR/
 BACKENDS = ("wilor",)  # landmark backends: ../WiLoR/
@@ -65,6 +67,8 @@ def make_landmarks(backend="wilor", **kw):
 RIG_PATH = os.path.join(HERE, "calib", "stereo.npz")
 BASELINE_M = 0.21  # cameras mounted 21 cm apart, lens to lens (measured 2026-10-10) (stereo_calib.py --baseline-in)
 
+CAM_FPS = 60      # requested capture rate (Elgato Facecam MK.2: 60 fps at 1280x720 and 1920x1080)
+CAPTURE_SIZE = (1920, 1080)  # live capture size; the rig file is scaled to it (scale_rig)
 MIN_FPS = 20.0    # configure() warns below this (measured per camera)
 OPEN_WAIT_S = 3.0  # first frame after opening (camera start-up, the permission prompt)
 
@@ -73,7 +77,7 @@ HAND_CONNECTIONS = [(0, 1), (1, 2), (2, 3), (3, 4), (0, 5), (5, 6), (6, 7), (7, 
                     (15, 16), (13, 17), (0, 17), (17, 18), (18, 19), (19, 20)]
 
 
-def open_capture(index, width, height, fps=30):
+def open_capture(index, width, height, fps=CAM_FPS):
     """(cv2.VideoCapture, first frame) for an AVFoundation camera at width x height,
     or (None, None) if it doesn't open or delivers nothing within OPEN_WAIT_S."""
     cap = cv2.VideoCapture(index, cv2.CAP_AVFOUNDATION)
@@ -95,8 +99,10 @@ def open_capture(index, width, height, fps=30):
 
 
 class Camera:
-    def __init__(self, index, width=640, height=480, fps=30):
+    def __init__(self, index, width=640, height=480, fps=CAM_FPS, timers=NULL_TIMERS, name=None):
         self.index = index
+        self.timers, self._tick = timers, f"{name or f'camera {index}'} frames"
+
         self.cap, f = open_capture(index, width, height, fps)
         if self.cap is None:
             raise RuntimeError(f"camera {index}: no frames (plugged in? camera access allowed for this "
@@ -122,10 +128,11 @@ class Camera:
                 continue
             with self.cond:
                 if self.frame is not None:
-                    self.period += 0.1 * (min(max(t - self.t, 1 / 60), 0.2) - self.period)
+                    self.period += 0.1 * (min(max(t - self.t, 1 / 120), 0.2) - self.period)
                 self.prev, self.prev_t = self.frame, self.t
                 self.frame, self.t, self.seq = f, t, self.seq + 1
                 self.cond.notify_all()
+            self.timers.tick(self._tick)
 
     def latest(self):
         with self.cond:
@@ -165,9 +172,9 @@ class StereoCam:
     def __init__(self, cams=DEFAULT_CAMS, size=(640, 480), **kw):
         if cams[0] == cams[1]:
             raise RuntimeError(f"--cams {cams[0]} {cams[1]}: two different cameras needed")
-        self.c0 = Camera(cams[0], *size, **kw)
+        self.c0 = Camera(cams[0], *size, name="cam0", **kw)  # timers: by role, not AVFoundation index
         try:
-            self.c1 = Camera(cams[1], *size, **kw)
+            self.c1 = Camera(cams[1], *size, name="cam1", **kw)
         except Exception:
             self.c0.close()
             raise
@@ -185,7 +192,7 @@ class StereoCam:
         msg = f"; fps {fps[0]:.0f}/{fps[1]:.0f}"
         if min(fps) < MIN_FPS:
             msg += (f"  SLOW CAMERA (< {MIN_FPS:.0f} fps): both on one USB hub? a dark room (auto "
-                    "exposure gets longer)? a size the camera can't do at 30 fps?")
+                    "exposure gets longer)? a size the camera can't do at --cam-fps?")
         return msg
 
     def pair(self, max_dt=0.04, timeout=1.0):
@@ -231,11 +238,12 @@ def draw_hand(img, px, color=(0, 255, 0)):
 
 
 def fit_view(img, max_w=1600):
-    """Downscale a side-by-side preview that would be wider than the screen."""
+    """Downscale a side-by-side preview that would be wider than the screen. Linear, not
+    INTER_AREA: 2560x720 -> 1600 took 15 ms with INTER_AREA (a quarter of a 60 fps frame)."""
     if img.shape[1] <= max_w:
         return img
     s = max_w / img.shape[1]
-    return cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_AREA)
+    return cv2.resize(img, None, fx=s, fy=s, interpolation=cv2.INTER_LINEAR)
 
 
 def sharpness(img):
@@ -282,12 +290,41 @@ def load_rig(path=RIG_PATH):
     return {k: z[k] for k in z.files}
 
 
+def scale_rig(rig, size):
+    """The rig at another capture size with the same aspect ratio. The Elgato Facecam MK.2's
+    16:9 modes are the same view at another scale (1280x720 -> 1920x1080 measured by feature
+    matching: x1.4999 / x1.4998, offset 0.25 px = pixel centers, 2026-10-11), so the
+    intrinsics scale (pixel centers kept) and distortion, R, t stay. Another aspect ratio is
+    a different crop of the sensor: recalibrate at that size instead. rig["calib_size"] keeps
+    the calibrated size (px settings tuned there scale with size / calib_size)."""
+    w0, h0 = (int(v) for v in rig["size"])
+    w, h = (int(v) for v in size)
+    out = dict(rig)
+    out.setdefault("calib_size", np.array((w0, h0)))
+    if (w, h) == (w0, h0):
+        return out
+    s = w / w0
+    if abs(h / h0 - s) > 1e-3:
+        raise ValueError(f"rig calibrated at {w0}x{h0}, capture {w}x{h}: another aspect ratio "
+                         "(a different crop) needs its own calibration (stereo_calib.py --size W H)")
+    for k in ("K0", "K1"):
+        K = np.array(rig[k], dtype=float)
+        K[0, 0] *= s
+        K[0, 1] *= s
+        K[1, 1] *= s
+        K[0, 2] = s * (K[0, 2] + 0.5) - 0.5
+        K[1, 2] = s * (K[1, 2] + 0.5) - 0.5
+        out[k] = K
+    out["size"] = np.array((w, h))
+    return out
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--cams", type=int, nargs=2, default=DEFAULT_CAMS, metavar=("LEFT", "RIGHT"),
                     help="AVFoundation indices: cam0 = left camera, cam1 = right (find them with --list)")
     ap.add_argument("--list", action="store_true", help="show every camera with its index, then quit")
-    ap.add_argument("--size", type=int, nargs=2, default=[640, 480], metavar=("W", "H"))
+    ap.add_argument("--size", type=int, nargs=2, default=list(CAPTURE_SIZE), metavar=("W", "H"))
     ap.add_argument("--backend", choices=BACKENDS, default="wilor", help="landmark backend")
     ap.add_argument("--no-landmarks", action="store_true",
                     help="cameras only (no WiLoR load): quick check, focusing the rings")
