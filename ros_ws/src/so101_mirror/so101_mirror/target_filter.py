@@ -29,13 +29,16 @@ def _wrap(a):
 
 
 class TargetInterpolator:
-    """[x y z roll pitch yaw] targets in, evenly paced samples out (angles wrap)."""
+    """[x y z roll pitch yaw] targets in, evenly paced samples out. Angles wrap to +-pi
+    (orientations) unless wrap=False: a joint angle such as wrist_roll (-185..+152 deg)
+    must not, or -182 deg came out as +178 and the wrist swung across its whole range."""
 
     AUTO_FACTOR = 0.9  # x median gap: ~as smooth as a full gap, a bit less lag
     AUTO_GAPS = 8      # recent gaps the median is taken over
 
-    def __init__(self, delay=0.04, tau=0.0, max_dt=0.1, keep=16, auto_max=0.0):
+    def __init__(self, delay=0.04, tau=0.0, max_dt=0.1, keep=16, auto_max=0.0, wrap=True):
         self.delay, self.tau, self.max_dt, self.auto_max = delay, tau, max_dt, auto_max
+        self.a0 = 3 if wrap else 1 << 30  # first wrapped index (past the end: nothing wraps)
         self.buf = deque(maxlen=keep)  # (t, target)
         self.out = self.out_t = None
 
@@ -66,9 +69,9 @@ class TargetInterpolator:
             if ta <= ts <= tb:
                 u = (ts - ta) / (tb - ta)
                 diff = b - a
-                diff[3:] = _wrap(diff[3:])
+                diff[self.a0:] = _wrap(diff[self.a0:])
                 out = a + u * diff
-                out[3:] = _wrap(out[3:])
+                out[self.a0:] = _wrap(out[self.a0:])
                 return out
         return self.buf[-1][1].copy()
 
@@ -80,9 +83,9 @@ class TargetInterpolator:
         if self.tau > 0 and self.out is not None:
             dt = min(max(0.0, t - self.out_t), self.max_dt)
             diff = x - self.out
-            diff[3:] = _wrap(diff[3:])
+            diff[self.a0:] = _wrap(diff[self.a0:])
             x = self.out + (1.0 - math.exp(-dt / self.tau)) * diff
-            x[3:] = _wrap(x[3:])
+            x[self.a0:] = _wrap(x[self.a0:])
         self.out, self.out_t = x, t
         return x.copy()
 
@@ -123,6 +126,13 @@ def _selftest():
     ti.add(0.0, [0, 0, 0, math.pi - 0.1, 0, 0])
     ti.add(1.0, [0, 0, 0, -math.pi + 0.1, 0, 0])
     assert abs(abs(ti.sample(0.5)[3]) - math.pi) < 1e-9
+    # wrap=False (joint angles): -182 deg stays -182, never +178
+    ti = TargetInterpolator(delay=0.0, tau=0.03, wrap=False)
+    for k in range(20):
+        ti.add(k * 0.05, [0, 0, 0, math.radians(-170 - k), 0, 0])
+        r = ti.sample(k * 0.05 + 0.01)[3]
+        assert r < -math.radians(169), math.degrees(r)
+    assert ti.sample(5.0)[3] < -math.pi
     # time-based smoothing: same result at any sample rate
     ends = []
     for hz in (25.0, 50.0, 100.0):

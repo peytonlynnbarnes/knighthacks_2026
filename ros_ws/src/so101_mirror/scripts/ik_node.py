@@ -141,8 +141,9 @@ class IKNode(Node):
 
         self.interp = TargetInterpolator(delay=gp("interp_delay"), tau=gp("smooth_tau"),
                                          auto_max=gp("interp_auto_max"))
+        # wrist_roll is a joint angle (-185..+152 deg): no +-180 wrap
         self.roll_interp = TargetInterpolator(delay=gp("interp_delay"), tau=gp("smooth_tau"),
-                                              auto_max=gp("interp_auto_max"))
+                                              auto_max=gp("interp_auto_max"), wrap=False)
         self.target = None                   # latest accepted offset [x y z r p y]
         self.target_t = None
         self.pubs = {j: self.create_publisher(Float64, ARM_TOPIC_PREFIX + j, 10)

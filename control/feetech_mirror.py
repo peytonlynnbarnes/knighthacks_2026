@@ -65,6 +65,8 @@ Safety:
       (2250 ticks/s ~ 200 deg/s). Use a lower --max-speed for first tests.
     - Ctrl-C / exit: goal = present, torque stays ON (the arm holds, it
       does not go limp). Use torque_off.py to release it.
+    - SIGUSR1 (the app's Torque Off button): exits with torque OFF on every
+      servo, the arm DROPS. The app asks for a confirming second click first.
     - Gripper (--gripper): torque on holding where it is (no homing), clamped
       to its usable range, rate limited (--grip-speed), holds when /gripper
       goes stale. It isn't in the lag/load abort (gripping an object stalls
@@ -75,6 +77,7 @@ Safety:
 import argparse
 import json
 import math
+import signal
 import sys
 import threading
 import time
@@ -130,6 +133,8 @@ GRIP_RELEASE = 30        # ticks the command must open past the contact to let g
 # Then it's handled like a block (BlockGuard): that joint stops pushing that way and
 # recovers when the command comes back. No abort, so the arm can always recover.
 STALL_ERR = 60       # ticks (~5 deg)
+MOVING_SPEED = 40    # ticks/s: a joint the servo reports moving faster isn't stuck (a low
+                     # --servo-accel joint slowing down to reverse looked stalled for ~0.5 s)
 STALL_MOVE = 8       # ticks
 STALL_S = 0.5
 # Blocked: pushing into something (table, object, person). A joint > BLOCK_ERR from its goal,
@@ -155,6 +160,25 @@ BLOCK_LOAD_UP = 350  # 0.1 % (35 %)
 DIR_NAMES = {"shoulder_lift": {1: "down", -1: "up"}, "elbow_flex": {1: "down", -1: "up"}}
 STATUS_TOPIC = "/hw/status"  # std_msgs/String JSON; must match hand_target_node.HW_STATUS_TOPIC
 STATUS_EVERY_S = 0.2
+
+
+ACCEL_TAU = 0.04  # s: with --max-accel, the goal's speed aims at closing the gap in this time
+
+
+def accel_step(err, v, vmax, amax, dt, tau=ACCEL_TAU):
+    """One tick of an acceleration-limited follower (anti-jerk): the goal's velocity v
+    (ticks/s) heads for err / tau, at most vmax, at most the speed it can still stop from
+    within err (no overshoot), and changes by at most amax * dt. Returns (step ticks, new v).
+    Pure, self-tested. The plain speed clip it replaces turned velocity on and off in one
+    tick (a corner = a jerk at every start and stop)."""
+    want = err / tau
+    # the fastest speed that can still brake to a stop within |err| in steps of dt
+    # (discrete: the continuous sqrt(2 a d) overshot by ~v dt / 2)
+    ad = amax * dt
+    stop = ad * (math.sqrt(0.25 + 2.0 * abs(err) / (ad * dt)) - 0.5) if ad > 0 else 0.0
+    want = math.copysign(min(abs(want), vmax, stop), err)
+    v = v + max(-amax * dt, min(amax * dt, want - v))
+    return v * dt, v
 
 
 class StallDetector:
@@ -199,11 +223,16 @@ class BlockGuard:
         self.up, self.load_up = up or {}, load_up
         self.blocked = {}  # joint -> (direction +1/-1 in ticks, tick where it stopped, since, why)
 
-    def update(self, joint, goal, present, load, t):
+    def update(self, joint, goal, present, load, t, speed=None):
         """Every tick, before the goals are computed. "pushing" (into something) or
         "stalled" (stuck far from the goal without the load to show for it: a servo
-        protection or weak servo) when `joint` just got blocked, else None."""
+        protection or weak servo) when `joint` just got blocked, else None. speed: the
+        servo's own reading (ticks/s); moving faster than MOVING_SPEED = not stuck."""
         if joint in self.blocked:
+            return None
+        if speed is not None and abs(speed) > MOVING_SPEED:
+            for d in (self.det, self.det_up, self.det_stall):
+                d.since.pop(joint, None)
             return None
         e = goal - present
         lifting = self.up.get(joint) == (1 if e > 0 else -1)
@@ -390,6 +419,16 @@ def selftest():
         assert not bg2.update("k", 2240, 2180, -100, i * 0.05)
     for i in range(20):  # high load AWAY from the goal (being pushed back by hand): not a block
         assert not bg2.update("k", 2240, 2180, +400, i * 0.05)
+    # anti-jerk follower: a 400-tick step: velocity never jumps more than amax*dt, reaches
+    # vmax, stops on target without overshoot
+    pos_, v, vs, peak = 0.0, 0.0, [], 0.0
+    for _ in range(200):
+        st_, v = accel_step(400 - pos_, v, 800, 4000, 0.02)
+        pos_ += st_; vs.append(v); peak = max(peak, pos_)
+    assert max(abs(a - b) for a, b in zip(vs, [0] + vs[:-1])) <= 4000 * 0.02 + 1e-6
+    assert max(vs) <= 800 + 1e-6 and abs(pos_ - 400) < 1 and peak - 400 < 1.0, (pos_, peak)
+    bg6 = BlockGuard(err=25, load=200, after_s=0.3)  # far behind but the servo says it's moving: not stuck
+    assert not any(bg6.update("r", 2300, 2150, -50, i * 0.05, speed=-300) for i in range(20))
     bg5 = BlockGuard(err=25, load=200, after_s=0.3)
     why = [bg5.update("m", 2300, 2150, -50, i * 0.05) for i in range(15)]  # 150 off, 5 % load
     assert "stalled" in why and bg5.blocked["m"][3] == "stalled" and bg5.clamp("m", 2400, 2400) == 2160
@@ -482,6 +521,12 @@ def main():
     ap.add_argument("--home-speed", type=float, default=400.0,
                     help=f"peak ticks/s of any joint while homing (shoulder_lift: at most "
                          f"--lift-speed; max {MAX_SPEED_CAP})")
+    ap.add_argument("--max-accel", type=float, default=0.0,
+                    help="anti-jerk: limit each goal's acceleration (ticks/s^2; 0 = off, the plain "
+                         "--max-speed clip); starts and stops become S-curves")
+    ap.add_argument("--servo-accel", type=int, default=SERVO_ACCEL,
+                    help=f"servo-side Acceleration register (1..254, x100 ticks/s^2; default {SERVO_ACCEL}): "
+                         "lower = the servo ramps its speed itself, smoother, a little more lag")
     ap.add_argument("--selftest", action="store_true", help="test the stall detector, no ROS or bus")
     ap.add_argument("--log", default=None, help="save every tick (time, goal, present, load, blocked "
                                                 "per arm joint) to this .npz on exit")
@@ -492,6 +537,8 @@ def main():
     for name in ("max_speed", "home_speed", "grip_speed", "lift_speed"):
         if not 0 < getattr(args, name) <= MAX_SPEED_CAP:
             sys.exit(f"--{name.replace('_', '-')} must be in (0, {MAX_SPEED_CAP}]")
+    if not 1 <= args.servo_accel <= 254:
+        sys.exit("--servo-accel must be 1..254")
     if not 0 < args.alpha <= 1:
         sys.exit("--alpha must be in (0, 1]")
     if args.live and args.no_bus:
@@ -528,6 +575,13 @@ def main():
     speed = {j: min(args.max_speed, args.lift_speed) if j == "shoulder_lift" else args.max_speed
              for j in ARM_JOINTS}
     lead = {j: max_lead(v) for j, v in speed.items()}
+    release = threading.Event()  # SIGUSR1: leave like Ctrl-C, but with torque OFF instead of holding
+
+    def on_release(*_):
+        release.set()
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGUSR1, on_release)
     try:
         if not args.no_bus:
             bus = sb.Bus(args.port)
@@ -571,7 +625,7 @@ def main():
             if not args.yes and input("Proceed? [y/N] ").strip().lower() != "y":
                 sys.exit("aborted, nothing changed")
             for j, sid in all_sids.items():
-                goals[j] = float(bus.torque_on_holding(sid, SERVO_ACCEL, SERVO_SPEED))
+                goals[j] = float(bus.torque_on_holding(sid, args.servo_accel, SERVO_SPEED))
             torque = True
             grip_start = goals.get("gripper")
             goals = home(bus, sids, {j: goals[j] for j in sids}, args.home_speed, dt, args.lift_speed)
@@ -588,7 +642,8 @@ def main():
         block = BlockGuard(up={j: d for j, names in DIR_NAMES.items() for d, n in names.items() if n == "up"})
         n_blocks, n_stalls = 0, 0
         stalled = {}           # (status field, always empty: stalls are blocks now)
-        loads, flags = {}, {}
+        loads, flags, speeds = {}, {}, {}
+        vel = {}  # --max-accel: each goal's velocity (ticks/s)
         last_t, loop_hz, last_status, last_key, next_t = None, 0.0, 0.0, None, None
         while rclpy.ok():
             t0 = time.monotonic()
@@ -608,6 +663,7 @@ def main():
                     st = bus.read_states(all_sids.values())
                     for j, sid in all_sids.items():
                         present[j], loads[j], flags[j] = st[sid]["pos"], st[sid]["load"], st[sid]["flags"]
+                        speeds[j] = st[sid]["speed"]
                 else:
                     for j, sid in all_sids.items():
                         present[j] = bus.position(sid)
@@ -619,7 +675,7 @@ def main():
             holding = False  # (status field kept; stalls no longer hold the whole arm)
             if torque:
                 for j in ARM_JOINTS:
-                    why = block.update(j, goals[j], present[j], loads.get(j, 0), t0)
+                    why = block.update(j, goals[j], present[j], loads.get(j, 0), t0, speeds.get(j))
                     if why:
                         d, at = block.blocked[j][:2]
                         goals[j] = block.hold_goal(j)
@@ -647,7 +703,11 @@ def main():
                     raw = max(lo, min(hi, sb.rad_to_ticks(j, targets[j])))
                     filt[j] = raw if j not in filt else filt[j] + args.alpha * (raw - filt[j])
                     if torque and not holding:
-                        step = max(-max_step[j], min(max_step[j], filt[j] - goals[j]))
+                        if args.max_accel > 0:  # anti-jerk: velocity changes at most max_accel/s
+                            step, vel[j] = accel_step(filt[j] - goals[j], vel.get(j, 0.0), speed[j],
+                                                      args.max_accel, min(period, 2 * dt))
+                        else:
+                            step = max(-max_step[j], min(max_step[j], filt[j] - goals[j]))
                         g = goals[j] + step
                         # never lead the joint by more than `lead` ticks: a slow
                         # joint then moves at its own best speed instead of the goal
@@ -657,6 +717,8 @@ def main():
                         g = block.clamp(j, g, filt[j])  # blocked: not further into the obstacle
                         if was and j not in block.blocked:
                             print(f"unblocked: {j} (command moved back)", flush=True)
+                        if args.max_accel > 0:  # a clamp (lead, block, limits) stopped it: no windup
+                            vel[j] = (max(lo, min(hi, g)) - goals[j]) / max(min(period, 2 * dt), 1e-3)
                         goals[j] = max(lo, min(hi, g))
                 if torque:
                     bus.send_goals({sids[j]: goals[j] for j in ARM_JOINTS})
@@ -733,9 +795,12 @@ def main():
             np.savez(args.log, ticks=np.array(tick_log, dtype=float), joints=np.array(ARM_JOINTS))
             print(f"tick log: {args.log} ({len(tick_log)} ticks)")
         if bus is not None:
-            if torque:
+            if torque or release.is_set():
                 bus.port.clearPort()  # Ctrl-C can land mid-transaction: drop the half packet
                 time.sleep(0.02)
+            if release.is_set():  # every servo, the gripper too (even without --gripper)
+                print(f"\nstopped, torque OFF on {bus.torque_off(list(sb.IDS.values()))} (the arm is limp)")
+            elif torque:
                 print(f"\nstopped, holding at {bus.hold(hold_ids)} (torque ON)")
             if bus.retries:
                 print(f"bus: {bus.retries} transaction(s) needed a retry this run")

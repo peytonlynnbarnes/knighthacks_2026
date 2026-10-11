@@ -86,9 +86,32 @@ Measured on the real arm: target → arm lag went from **570 ms to about 220 ms*
 - A status line from the driver in the preview: loop rate, worst lag, and a red banner when a
   joint is blocked or stalled, or the driver stops.
 - Left-roll gain from the calibration's quarter turn: a 90° hand turn had read as ~45°.
-- Runs as a "Hand Tracker" macOS app (`macos_app.py`); `--timing` stage timers (`timing.py`);
-  1080p capture with the rig scaled to it.
-- README: libomp fix, iCloud file eviction, timing expectations.
+- **Hand tracking speed:** about **10 → 20–21 targets/s** with one hand, and the preview went
+  from 30 to **60 fps** (measured live, 2026-10-11):
+  - torch 2.5.1 → **2.14.1** (torchvision 0.29.1, ultralytics 8.4.175, in `requirements.txt`).
+    WiLoR on both views went from 83 to 48 ms on the M5 Pro GPU. This was the main gain.
+  - Threads: camera readers → `gpu` (pair + WiLoR) → `pose` (triangulate, map, publish) → the
+    main thread (preview at camera rate). Replays stay single-threaded and give bit-identical
+    output.
+  - The periodic YOLO re-check runs on the CPU in its own thread instead of before each
+    forward pass (one-hand mode; `--wilor-yolo-sync` restores the old behaviour). One
+    GPU → CPU copy per call instead of four.
+  - Cameras at 60 fps (`--cam-fps`, was a fixed 30). The preview downscales each view before
+    drawing (an `INTER_AREA` resize of the full image had cost 15 ms per frame).
+  - Two hands stay GPU-bound at about 13 targets/s: 4 crops take ~75 ms per pass.
+- **`--timing`** (`timing.py`): every 2 s, a table of each stage's rate, mean / p90 / max time
+  and share of its thread, plus a line in the preview.
+- **1080p capture:** both cameras do 1920×1080 at 60 fps, and that is the same view as 720p
+  scaled ×1.5 (measured). So the 720p calibration is scaled at load (`stereo_cam.scale_rig`)
+  with no recalibration, and the pixel-based settings scale with it. `--size 1280 720` goes
+  back.
+- **"Hand Tracker" macOS app** (`macos_app.py`): started from a terminal, the window belonged
+  to Terminal (no Dock icon; Cmd-Tab went to Terminal). The node now relaunches itself through a
+  generated app bundle (`~/Library/Application Support/kh/`). Output stays in the terminal and
+  Ctrl-C there stops it. The app has its own camera permission. `--no-app` keeps the old
+  behaviour.
+- README: the libomp fix after installing torch, iCloud file eviction (scripts hang at start
+  when `~/Documents` files are offloaded), and timing expectations.
 
 ---
 

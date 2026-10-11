@@ -228,6 +228,17 @@ class Bus:
         self.w1(sid, TORQUE_ENABLE, 1)
         return pos
 
+    def torque_off(self, sids):
+        """Torque off: the joints go limp and the arm DROPS. Returns the ids that took it."""
+        done = []
+        for sid in sids:
+            try:
+                self.w1(sid, TORQUE_ENABLE, 0)
+                done.append(sid)
+            except RuntimeError as e:
+                print(f"torque off id {sid}: {e}", file=sys.stderr)
+        return done
+
     def send_goals(self, goals):
         """Sync-write {sid: ticks} so the joints move together."""
         self.sync.clearParam()

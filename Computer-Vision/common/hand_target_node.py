@@ -103,6 +103,7 @@ from hand_mapping import (BOX_MAX, BOX_MIN, IMM_PRESETS, KALMAN_DEFAULTS, Cylind
 from stereo_cam import (BACKENDS, CAM_FPS, CAPTURE_SIZE, DEFAULT_CAMS, RIG_PATH, StereoCam, draw_hand, load_rig,
                         make_landmarks, scale_rig)
 from timing import Timers
+from ui_link import NodeLink
 
 BALL_TOPIC = "/ball_position"  # must match so101_mirror.BALL_TOPIC
 GRIP_TOPIC = "/gripper"        # std_msgs/Float64, 0 = open .. 1 = closed (feetech_mirror --gripper)
@@ -443,6 +444,9 @@ def main():
     ap.add_argument("--mono-fallback", action="store_true",
                     help="track the palm from one camera when the other loses the hand")
     ap.add_argument("--no-view", action="store_true", help="no preview window")
+    ap.add_argument("--ui-port", type=int, default=None,
+                    help="send the preview to the app window (ui/app.py) on this localhost port "
+                         "instead of a cv2 window; it sends c / q back (ui_link.py)")
     ap.add_argument("--no-app", action="store_true",
                     help="macOS: don't relaunch as the 'Hand Tracker' app (Dock icon, Cmd-Tab); the "
                          "window then belongs to the terminal")
@@ -502,6 +506,11 @@ def main():
     ap.add_argument("--roll-sign", type=float, default=1.0, choices=[1.0, -1.0],
                     help="two hands: -1 if wrist_roll turns the opposite way to the left hand")
     args = ap.parse_args()
+    ui = None
+    if args.ui_port is not None:  # the app window shows the preview; it owns the Dock icon
+        args.no_view, args.no_app = False, True
+        ui = NodeLink(args.ui_port)
+        ui.send({"loading": "Starting the hand tracker…"})
     if not args.no_view and not args.replay and not args.no_app:
         macos_app.relaunch_in_app("Hand Tracker", "com.kh.handtracker")  # returns only inside the app
         macos_app.register("Hand Tracker")  # Dock name + icon, to the front
@@ -616,6 +625,8 @@ def main():
               f"{cam.argv or '(defaults)'}")
     else:
         # backend first: WiLoR takes ~15 s to load, and missing packages fail before the cameras open
+        if ui is not None:
+            ui.send({"loading": "Loading the hand model…"})
         lms = make_landmarks(args.backend, hand=args.wilor_hand, yolo_every=args.wilor_yolo_every,
                              fp32=args.wilor_fp32, warmup_size=size,  # MPS compiles per input shape
                              hands=2 if two else 1, yolo_async=not args.wilor_yolo_sync, timers=T)
@@ -627,6 +638,8 @@ def main():
                   f"recorded with: {cam.argv or '(defaults)'}")
         else:
             # the intrinsics only hold at the calibrated size
+            if ui is not None:
+                ui.send({"loading": "Opening the cameras…"})
             cam = StereoCam(args.cams, size=size, fps=args.cam_fps, timers=T)
             print("cameras:", cam.configure())
     skew = None if args.no_skew_correct else h3.SkewCorrector(max_speed_px=4000.0 * px_s)
@@ -820,6 +833,7 @@ def main():
         if time.monotonic() - fps_t > 1.0:
             fps, fps_n, fps_t = fps_n / (time.monotonic() - fps_t), 0, time.monotonic()
         return dict(f0=f0, f1=f1, px0=px0, px1=px1_raw, pose=pose, status=status, fps=fps,
+                    calibrating=calib is not None or (two and lcal is not None), published=published,
                     skew_ms=(s["t1"] - s["t0"]) * 1000,
                     target=target if calib is None else None, left_px=left_px, left_line=left_line)
 
@@ -854,6 +868,12 @@ def main():
             if args.timing and T.last:
                 lines.append("ms " + T.summary(["wilor.forward", "wilor.yolo", "wilor.crop", "wilor.post",
                                                 "gpu.pair_wait", "pose.total", "view.draw", "view.imshow"]))
+            if ui is not None:  # the app draws the text in its status card
+                kind = ("calib" if snap["calibrating"] else "track" if snap["published"]
+                        else "lost" if snap["target"] is not None else "hold")
+                arm = pub.arm_line()
+                ui.send({"lines": lines, "kind": kind, "arm": None if arm is None else list(arm)}, view)
+                return ui.key()
             for i, line in enumerate(lines):
                 cv2.putText(view, line, (10, 25 + 28 * i), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                             (0, 0, 255) if snap["pose"] is None else (0, 255, 255), 2)
@@ -964,6 +984,8 @@ def main():
             seq, view_n, view_t, view_fps = -1, 0, time.monotonic(), 0.0
             while not stop.is_set():
                 report_timing()
+                if ui is not None and ui.closed:  # the app went away
+                    break
                 if args.no_view:
                     stop.wait(0.1)
                     continue
@@ -1004,6 +1026,8 @@ def main():
         lms.close()
         cam.close()
         pub.close()
+        if ui is not None:
+            ui.close()
         cv2.destroyAllWindows()
 
 
