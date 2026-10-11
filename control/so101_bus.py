@@ -43,9 +43,15 @@ ACCELERATION = 41
 GOAL_POSITION = 42
 GOAL_SPEED = 46
 PRESENT_POSITION = 56
+PRESENT_SPEED = 58
 PRESENT_LOAD = 60
 PRESENT_VOLTAGE = 62
 PRESENT_TEMPERATURE = 63
+STATUS = 65
+# read_states(): one sync read of 56..65 (position, speed, load, voltage, temperature, -, status)
+STATE_LEN = STATUS - PRESENT_POSITION + 1
+# Status (65) bits, Feetech STS manual: a set bit = that protection has tripped
+STATUS_BITS = ("voltage", "sensor", "temperature", "current", "angle", "overload")
 
 RETRIES = 2  # extra attempts per bus transaction before raising
 
@@ -103,6 +109,11 @@ def effective_limits(name, eeprom):
     return max(lo, slo), min(hi, shi)
 
 
+def sign_mag(v, bit):
+    """Feetech sign-magnitude register value: the sign is bit `bit`."""
+    return -(v & ((1 << bit) - 1)) if v & (1 << bit) else v
+
+
 def rad_to_ticks(name, rad):
     sign, zero = JOINT_CAL[name]
     return zero + sign * rad * TICKS_PER_REV / (2 * math.pi)
@@ -128,6 +139,7 @@ class Bus:
         if not self.port.setBaudRate(BAUD):
             sys.exit(f"could not set baud {BAUD}")
         self.sync = scs.GroupSyncWrite(self.port, self.pkt, GOAL_POSITION, 2)
+        self.sync_read = None  # GroupSyncRead for read_states, built for the ids asked
         self.retries = 0  # transactions that needed a retry (for reporting)
 
     def ping(self, sid):
@@ -167,8 +179,30 @@ class Bus:
         return self.r2(sid, PRESENT_POSITION)
 
     def load(self, sid):
-        v = self.r2(sid, PRESENT_LOAD)  # sign-magnitude, sign in bit 10, 0.1 %
-        return -(v & 0x3FF) if v & 0x400 else v
+        return sign_mag(self.r2(sid, PRESENT_LOAD), 10)  # sign in bit 10, 0.1 %
+
+    def read_states(self, sids):
+        """Position, speed (ticks/s), load (0.1 %) and tripped protections of several
+        servos in one sync read: one bus round trip instead of one per register and
+        servo. Returns {sid: {"pos", "speed", "load", "flags"}}; raises RuntimeError
+        like the single reads."""
+        sids = list(sids)
+        if self.sync_read is None or list(self.sync_read.data_dict) != sids:
+            self.sync_read = scs.GroupSyncRead(self.port, self.pkt, PRESENT_POSITION, STATE_LEN)
+            for sid in sids:
+                self.sync_read.addParam(sid)
+        g = self.sync_read
+        self._retry(f"sync read ids {sids}", lambda: (g.txRxPacket(),))
+        out = {}
+        for sid in sids:
+            if not g.isAvailable(sid, PRESENT_POSITION, STATE_LEN):
+                raise RuntimeError(f"sync read: no data from id {sid}")
+            status = g.getData(sid, STATUS, 1)
+            out[sid] = {"pos": g.getData(sid, PRESENT_POSITION, 2),
+                        "speed": sign_mag(g.getData(sid, PRESENT_SPEED, 2), 15),
+                        "load": sign_mag(g.getData(sid, PRESENT_LOAD, 2), 10),
+                        "flags": [n for i, n in enumerate(STATUS_BITS) if status >> i & 1]}
+        return out
 
     def limits(self, sid):
         """EEPROM Min/Max_Position_Limit (read only). Odd/unset -> full range."""
