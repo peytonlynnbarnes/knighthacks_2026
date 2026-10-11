@@ -12,6 +12,11 @@ Started from a terminal, it re-runs itself as the "Mimisis" app (its own Dock ic
 entry and camera permission; output stays in the terminal; macos_app.py, as the hand
 tracker does); --no-app runs it in the terminal's process.
 
+    python ui/app.py --install       # ~/Applications/Mimisis.app: open it without a terminal
+Opened from the Finder, the app loads the conda env + ROS workspace environment that
+--install saved (run it again after changing the env), runs live (as plain
+`python ui/app.py`), and logs to ~/Library/Logs/Mimisis.log.
+
 One Start / Stop button. Record (while running) records the arm's path: what the hand
 commands, with its timing; click again to stop. Play sends the last take back to the arm
 (it glides to the start first, then back to the hand when done; click again to stop).
@@ -104,6 +109,80 @@ TORQUE_CONFIRM_MS = 4000  # Torque Off: the second click must come within this
 RUN_SWITCH_GUARD_S = 0.5  # Start/Stop ignores clicks this long after it switched
 TORQUE_WARNING = "Click Torque Off again to drop the arm"
 PREVIEW_ASPECT = 32 / 9  # two 16:9 views side by side, until the first frame says otherwise
+
+# The app bundle: ~/Applications/Mimisis.app (Launchpad, Spotlight, Dock). Opened from the
+# Finder it sets up the conda env + ROS workspace (FINDER_RUN) and logs to LOG_PATH; started
+# from a terminal, this script re-runs itself through the same bundle.
+BUNDLE_ID = "com.kh.mimisis"
+BUNDLE_DIR = os.path.expanduser("~/Applications")
+# the repo is in ~/Documents: opened from the Finder, macOS asks once for access to it
+BUNDLE_PLIST = {"NSDocumentsFolderUsageDescription":
+                "Mimisis runs the hand tracking and arm control code in your Documents folder."}
+LOG_PATH = os.path.expanduser("~/Library/Logs/Mimisis.log")
+# Finder start: no shell reads ~/Documents. macOS ties a file access to the app only when
+# the process runs an executable inside the bundle (the python link); /bin/bash running the
+# bundle's script counted as bash, so reading ros_ws/install/setup.bash was denied with no
+# prompt (2026-10-11). So --install (from a terminal, which has access) records the conda +
+# ROS environment in the bundle (ENV_FILE), and the script only loads it and starts python;
+# python's first read of the repo asks for Documents access in Mimisis's name.
+ENV_FILE = "env.sh"  # in Contents/Resources
+FINDER_RUN = """\
+LOG={log}
+mv -f "$LOG" "$LOG.1" 2>/dev/null
+exec >"$LOG" 2>&1
+fail() {{
+    echo "Mimisis: $1"
+    osascript -e "display alert \\"Mimisis couldn't start\\" message \\"$1\\n\\nLog: $LOG\\"" >/dev/null
+    exit 1
+}}
+ENV="$(dirname "$0")/../Resources/{env_file}"
+[ -f "$ENV" ] || fail "no saved environment: run python ui/app.py --install once from a terminal"
+source "$ENV"
+cd {root} || fail "no repo at {root}"
+exec "$(dirname "$0")/python" -u ui/app.py --no-app
+"""
+# environment variables not saved for the Finder start (the shell's own)
+ENV_SKIP = {"PWD", "OLDPWD", "SHLVL", "_", "TERM", "TERM_PROGRAM", "TERM_SESSION_ID", "TMPDIR", "SSH_AUTH_SOCK"}
+
+
+def finder_run():
+    """FINDER_RUN for this repo (the same text every time: an unchanged bundle isn't rewritten)."""
+    import shlex
+    return FINDER_RUN.format(log=shlex.quote(LOG_PATH), env_file=ENV_FILE, root=shlex.quote(os.path.dirname(HERE)))
+
+
+def save_env(app_path):
+    """The conda env + ROS workspace environment, made in a clean bash (as the Finder would
+    start it) and saved to the bundle's ENV_FILE. Needs a conda env active (to know which)."""
+    import shlex
+    import subprocess
+    conda_exe, env = os.environ.get("CONDA_EXE"), os.environ.get("CONDA_DEFAULT_ENV")
+    if not conda_exe or not env:
+        sys.exit("--install: run it with the conda env active (conda activate ros2_jazzy)")
+    conda_sh = os.path.join(os.path.dirname(os.path.dirname(conda_exe)), "etc", "profile.d", "conda.sh")
+    root = os.path.dirname(HERE)
+    cmd = (f"source {shlex.quote(conda_sh)} && conda activate {shlex.quote(env)} && cd {shlex.quote(root)} "
+           "&& source ros_ws/install/setup.bash && env -0")
+    base = {k: os.environ[k] for k in ("HOME", "USER", "LOGNAME", "LANG") if k in os.environ}
+    r = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c", cmd], capture_output=True,
+                       env=dict(base, PATH="/usr/bin:/bin:/usr/sbin:/sbin"))
+    if r.returncode != 0:
+        sys.exit(f"--install: setting up the environment failed:\n{r.stderr.decode(errors='replace')[-2000:]}")
+    found = dict(kv.split("=", 1) for kv in r.stdout.decode().split("\0") if "=" in kv)
+    if "so101_mirror" not in found.get("AMENT_PREFIX_PATH", ""):
+        sys.exit("--install: so101_mirror isn't in the ROS workspace (colcon build in ros_ws)")
+    # the live setup's ROS domain (CLAUDE.md), unless this shell sets its own
+    for k, default in (("ROS_DOMAIN_ID", "42"), ("ROS_AUTOMATIC_DISCOVERY_RANGE", "LOCALHOST")):
+        found[k] = os.environ.get(k, default)
+    lines = [f"# generated by ui/app.py --install: conda env {env} + ros_ws, for the Finder start\n"]
+    lines += [f"export {k}={shlex.quote(v)}\n" for k, v in sorted(found.items())
+              if k not in ENV_SKIP and k.isidentifier() and not k.startswith(("BASH_FUNC", "__CF"))]
+    path = os.path.join(app_path, "Contents", "Resources", ENV_FILE)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        f.writelines(lines)
+    return path
+
 
 # hand_target_node.py settings for this setup (CLAUDE.md "Run"); extra ones go after --
 HAND_ARGS = ["--cams", "1", "0", "--two-hands", "--z-min", "-0.16", "--grip-closed-curl", "0.75"]
@@ -674,6 +753,9 @@ def main():
     ap.add_argument("--cams", nargs=2, default=None, metavar=("LEFT", "RIGHT"),
                     help="camera indices (default 1 0; stereo_cam.py --list)")
     ap.add_argument("--contrast", action="store_true", help="print the palette's text contrast ratios and exit")
+    ap.add_argument("--install", action="store_true",
+                    help=f"write {BUNDLE_DIR}/{APP_NAME}.app (open it from the Finder, Launchpad, Spotlight "
+                         "or the Dock; no terminal) and exit. Any terminal start updates it too")
     ap.add_argument("--no-app", action="store_true",
                     help="run in the terminal's process instead of as the Mimisis app (no Dock icon / Cmd-Tab "
                          "entry of its own; camera access then belongs to the terminal)")
@@ -683,9 +765,17 @@ def main():
             r = contrast(fg, bg)
             print(f"{name:<15} {fg.name()} on {bg.name()}  {r:4.1f}:1  {'ok' if r >= 4.5 else 'LOW'}")
         return
-    if not args.no_app:  # its own app (Dock, Cmd-Tab, camera permission); returns only inside it
+    if args.install or not args.no_app:
         import macos_app  # Computer-Vision/common, on the path via pipeline.py
-        macos_app.relaunch_in_app(APP_NAME, "com.kh.mimisis", icon=LOGO_PATH)
+        finder = finder_run()
+        if args.install:
+            app_path = macos_app._bundle(APP_NAME, BUNDLE_ID, LOGO_PATH, BUNDLE_DIR, finder, BUNDLE_PLIST)
+            env_path = save_env(app_path)
+            print(f"installed {app_path} (environment: {env_path}): open it from the Finder / Launchpad / "
+                  f"Spotlight; log {LOG_PATH}. Run --install again after changing the conda env.")
+            return
+        # its own app (Dock, Cmd-Tab, camera permission); returns only inside it
+        macos_app.relaunch_in_app(APP_NAME, BUNDLE_ID, LOGO_PATH, BUNDLE_DIR, finder, BUNDLE_PLIST)
     live = not (args.dry_run or args.no_bus)
     hand = list(HAND_ARGS)
     if args.cams:
